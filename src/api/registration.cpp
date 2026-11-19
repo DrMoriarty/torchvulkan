@@ -1,8 +1,21 @@
 #include <torch/extension.h>
 #include <ATen/autocast_mode.h>
+#include "api/ops/internal.h"
 
 TORCH_LIBRARY_IMPL(_, AutocastPrivateUse1, m) {
     m.fallback(torch::CppFunction::makeFallthrough());
+}
+
+// custom private ops (the torchvulkan analogue of ATen's _weight_int8pack_mm /
+// _weight_int4pack_mm): weight-only quantized matmul, kernels in ops/quant.cpp
+TORCH_LIBRARY(torchvulkan, m) {
+    m.def("weight_int8_mm(Tensor x, Tensor w_packed, Tensor scales, Tensor? bias=None) -> Tensor");
+    m.def("weight_int4_mm(Tensor x, Tensor w_packed, Tensor scales, Tensor zeros, Tensor? bias=None) -> Tensor");
+}
+
+TORCH_LIBRARY_IMPL(torchvulkan, PrivateUse1, m) {
+    m.impl("weight_int8_mm", &torchvulkan::weight_int8_mm);
+    m.impl("weight_int4_mm", &torchvulkan::weight_int4_mm);
 }
 
 namespace at::autocast {

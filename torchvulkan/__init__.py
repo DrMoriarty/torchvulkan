@@ -162,6 +162,25 @@ def get_amp_supported_dtype() -> list:
 def is_bf16_supported() -> bool:
     return torch.bfloat16 in get_amp_supported_dtype()
 
+def weight_int8_mm(x, w_packed, scales, bias=None) -> torch.Tensor:
+    """Weight-only int8 matmul: out = x @ dequant(w_packed).T (+ bias).
+
+    w_packed uint8 (N, K), one byte per k, value = (q - 128) * scale;
+    scales float32 (N, ngroups), group = K // ngroups k-elements per scale
+    (ngroups == 1 -> one scale per output row); x fp16/fp32, out in x.dtype.
+    """
+    return torch.ops.torchvulkan.weight_int8_mm(x, w_packed, scales, bias)
+
+def weight_int4_mm(x, w_packed, scales, zeros, bias=None) -> torch.Tensor:
+    """Weight-only int4 matmul: out = x @ dequant(w_packed).T (+ bias).
+
+    w_packed uint8 (N, ceil(K/2) rounded up to a multiple of 16 per row), two
+    nibbles per byte (low nibble = even k), value = (q - zero) * scale; scales
+    and zeros float32 (N, ngroups), asymmetric per-group zero point; x
+    fp16/fp32, out in x.dtype. Rows may be padded - padding is never read.
+    """
+    return torch.ops.torchvulkan.weight_int4_mm(x, w_packed, scales, zeros, bias)
+
 def _is_in_bad_fork() -> bool:
     return _C._is_in_bad_fork()
 

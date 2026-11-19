@@ -201,6 +201,14 @@ KERNELS = [
     Kernel('matmul_gemv', 'ops/matmul_gemv.slang', [
         Entry('matmul_gemv_main', FLOATS, ('wide_vec',)),
     ]),
+    # weight-only quantized GEMV (M == 1): fp16/fp32 activations, int8/int4
+    # weights dequantized in registers; PACK is the bits-per-weight constant
+    Kernel('quant_gemv_w8', 'ops/quant_gemv.slang', [
+        Entry('quant_gemv_main', [F16, F32], (), constants=(8,)),
+    ]),
+    Kernel('quant_gemv_w4', 'ops/quant_gemv.slang', [
+        Entry('quant_gemv_main', [F16, F32], (), constants=(4,)),
+    ]),
     Kernel('conv_128', 'ops/conv.slang', [
         Entry('conv_main', [d for d in FLOATS if d.bytes < 8], ('vec',), constants=(128,)),
     ]),

@@ -43,6 +43,12 @@ ComplexParts complex_logaddexp(const ComplexParts& x, const ComplexParts& y);
 // ops/reduce.cpp
 at::Tensor sum_vulkan(const at::Tensor& self, c10::optional<at::ScalarType> dtype);
 
+// ops/quant.cpp
+at::Tensor weight_int8_mm(const at::Tensor& x, const at::Tensor& w_packed, const at::Tensor& scales,
+    const c10::optional<at::Tensor>& bias);
+at::Tensor weight_int4_mm(const at::Tensor& x, const at::Tensor& w_packed, const at::Tensor& scales,
+    const at::Tensor& zeros, const c10::optional<at::Tensor>& bias);
+
 // tensor/allocation.cpp
 void resize_bytes_vulkan(c10::StorageImpl* storage, size_t nbytes);
 const at::Tensor& resize_vulkan(const at::Tensor& self, c10::IntArrayRef size, c10::optional<at::MemoryFormat> memory_format);
