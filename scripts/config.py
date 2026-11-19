@@ -66,6 +66,7 @@ def vec_size(nbytes):
 # the two dtypes, since both tensors are stepped by the same amount.
 VALUE_ARGS = {
     'vec': vec_size,
+    'wide_vec': lambda nbytes: int(min(16 / nbytes, 8)),  # full 128-bit loads
 }
 
 
@@ -196,6 +197,9 @@ KERNELS = [
     ]),
     Kernel('matmul_simd_64', 'ops/matmul_simd.slang', [
         Entry('matmul_simd_main', DTYPES, ('vec',), constants=(64,)),
+    ]),
+    Kernel('matmul_gemv', 'ops/matmul_gemv.slang', [
+        Entry('matmul_gemv_main', FLOATS, ('wide_vec',)),
     ]),
     Kernel('conv_128', 'ops/conv.slang', [
         Entry('conv_main', [d for d in FLOATS if d.bytes < 8], ('vec',), constants=(128,)),

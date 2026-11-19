@@ -153,6 +153,135 @@ bool fits_matmul_indexing(const MatmulOperands& ops, const at::Tensor& out)
     return fits_32bit_indexing({ops.self_b, ops.other_b, ops.bias_b, out});
 }
 
+// dedicated GEMV kernel for matmuls with a single output row: one subgroup per
+// output column, streaming the weights along their contiguous k-stride with
+// per-lane vector loads and a subgroup reduction. The general GEMM kernels are
+// tile-based and starve the memory pipeline on M == 1. The batch rides the
+// grid's z dimension, so batched M == 1 matmuls (bmm) route here too.
+at::Tensor dispatch_matmul_gemv_shader(
+    const at::Tensor& self_,
+    const at::Tensor& other_,
+    const at::Tensor& bias_,
+    const at::Scalar& alpha,
+    const at::Scalar& beta,
+    MatmulActivation activation,
+    std::function<at::Tensor()> cpu_fallback)
+{
+    constexpr uint32_t WG = 128;
+
+    uint32_t has_bias = (bias_.defined() && beta.toDouble() != 0.0) ? 1 : 0;
+    MatmulShape shape = get_matmul_shape(self_, other_);
+    uint32_t K = shape.K, N = shape.N;
+    int64_t B = shape.B;
+
+    DeviceContext* device = get_device_context(self_);
+    c10::ScalarType result_dtype = at::result_type(shape.self, shape.other);
+    if (!is_dtype_supported(device, result_dtype)) {
+        TORCHVULKAN_FALLBACK("A ", result_dtype, " GEMV can't run on the Vulkan device. Falling back to CPU.");
+        return cpu_fallback();
+    }
+
+    c10::ScalarType compute_type = matmul_accumulate_dtype(result_dtype);
+
+    TORCH_CHECK(
+        activation != MatmulActivation::GELU || at::isFloatingType(result_dtype),
+        "torchvulkan [ERROR]: gelu is only defined for floating point matmuls, not ", result_dtype
+    );
+
+    MatmulOperands ops = prepare_matmul_operands(shape.self, shape.other, bias_, has_bias, result_dtype, 1, K, N, B, shape.batch_shape);
+    at::Tensor out = at::empty({B, 1, N}, ops.self_b.options());
+
+    if (N == 0 || B == 0) return finish_matmul_output(out, shape);
+    if (K == 0) {
+        at::Tensor result = has_bias ? (ops.bias_b * beta) : out.zero_();
+        return finish_matmul_output(apply_matmul_activation(result, activation), shape);
+    }
+    if (!fits_matmul_indexing(ops, out)) {
+        TORCHVULKAN_FALLBACK("A GEMV is too large for 32-bit indexing. Falling back to CPU.");
+        return cpu_fallback();
+    }
+    if (WG > device->properties.limits.maxComputeWorkGroupInvocations) {
+        TORCHVULKAN_FALLBACK("The GEMV workgroup of ", WG, " exceeds the device limit. Falling back to CPU.");
+        return cpu_fallback();
+    }
+
+    // aligned path requirements: the weight's k-stride is contiguous, the whole
+    // k-range divides into full subgroup-wide steps, and every 16-byte load
+    // stays aligned
+    const uint32_t subgroup = device->default_subgroup_size;
+    const uint32_t wv = std::min<uint32_t>(16 / c10::elementSize(result_dtype), 8);
+    auto aligned_16b = [](const at::Tensor& t) { return get_tensor_address(t) % 16 == 0; };
+    uint32_t isAligned =
+        (WG % subgroup == 0) && (K % (subgroup * wv) == 0) &&
+        ops.other_b.stride(1) == 1 && ops.other_b.stride(2) % wv == 0 &&
+        ops.self_b.stride(2) == 1 &&
+        aligned_16b(ops.self_b) && aligned_16b(ops.other_b) ? 1 : 0;
+
+    SpecializationBuilder spd{};
+    spd.push(WG)
+       .push(isAligned)
+       .push(has_bias)
+       .push(static_cast<uint32_t>(activation));
+    SpecializationArgs specialization = spd.build();
+
+    auto strides_of = [](const at::Tensor& t, uint32_t (&strides)[4]) {
+        for (int i = 0; i < 3; i++) strides[i] = static_cast<uint32_t>(t.stride(i));
+        strides[3] = 0;
+    };
+    uint32_t strides_a[4], strides_b[4], strides_c[4];
+    uint32_t strides_bias[4] = {0, 0, 0, 0};
+    strides_of(ops.self_b, strides_a);
+    strides_of(ops.other_b, strides_b);
+    strides_of(out, strides_c);
+    if (has_bias) strides_of(ops.bias_b, strides_bias);
+
+    std::vector<at::Tensor> readTensors = {ops.self_b, ops.other_b};
+    if (has_bias) readTensors.push_back(ops.bias_b);
+
+    materialize_cow(out);
+
+    PushConstantBuilder pcs{};
+    pcs.push(get_tensor_address(ops.self_b));
+    pcs.push(get_tensor_address(ops.other_b));
+    pcs.push(get_tensor_address(out));
+    pcs.push(has_bias ? get_tensor_address(ops.bias_b) : (uint64_t)0);
+    pcs.push_array(strides_a);
+    pcs.push_array(strides_b);
+    pcs.push_array(strides_c);
+    pcs.push_array(strides_bias);
+    pcs.push((uint32_t)1); // M
+    pcs.push(N);
+    pcs.push(K);
+    pcs.push((uint32_t)0);
+    pcs.push_scalar(alpha, compute_type);
+    pcs.push_scalar(beta, compute_type);
+
+    // aligned path: each subgroup computes one output column, so a workgroup
+    // of WG threads covers WG / subgroup columns
+    uint32_t columns_per_wg = isAligned ? WG / std::max(subgroup, (uint32_t)1) : WG;
+    device->shader_manager->dispatchShader(
+        ShaderKey{torchvulkan::Kernel::MATMUL_GEMV, result_dtype},
+        device->default_subgroup_size,
+        specialization,
+        pcs.build(),
+        /* read = */ readTensors,
+        /* write = */ {out},
+        (N + columns_per_wg - 1) / columns_per_wg, 1, static_cast<uint32_t>(B)
+    );
+
+    return finish_matmul_output(out, shape);
+}
+
+// GEMV routing predicate: floating-point matmuls with a single output row, as
+// long as the batch fits the grid's z dimension (otherwise the GEMM kernels
+// batch in chunks)
+bool routes_to_gemv(const MatmulShape& shape, DeviceContext* device)
+{
+    return at::isFloatingType(at::result_type(shape.self, shape.other)) &&
+        shape.M == 1 &&
+        shape.B <= (int64_t)device->properties.limits.maxComputeWorkGroupCount[2];
+}
+
 at::Tensor dispatch_matmul_simd_shader(
     const at::Tensor& self_, 
     const at::Tensor& other_,
@@ -184,6 +313,11 @@ at::Tensor dispatch_matmul_simd_shader(
         activation != MatmulActivation::GELU || at::isFloatingType(result_dtype),
         "torchvulkan [ERROR]: gelu is only defined for floating point matmuls, not ", result_dtype
     );
+
+    // route single-row matmuls to the dedicated GEMV kernel before the tile logic
+    if (routes_to_gemv(shape, device)) {
+        return dispatch_matmul_gemv_shader(self_, other_, bias_, alpha, beta, activation, cpu_fallback);
+    }
 
     uint32_t max_shared_memory = device->properties.limits.maxComputeSharedMemorySize;
     auto shared_bytes = [&](uint32_t tile_m) {
@@ -486,6 +620,12 @@ at::Tensor dispatch_matmul_shader(
     std::function<at::Tensor()> cpu_fallback)
 {
     DeviceContext* device = get_device_context(self);
+
+    // single-row matmuls go to the dedicated GEMV kernel on every device
+    MatmulShape shape = get_matmul_shape(self, other);
+    if (routes_to_gemv(shape, device)) {
+        return dispatch_matmul_gemv_shader(self, other, bias, alpha, beta, activation, cpu_fallback);
+    }
 
     if (device->support_coopmat) {
         at::Tensor out = dispatch_matmul_coop_shader(self, other, bias, alpha, beta, cpu_fallback);
