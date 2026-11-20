@@ -17,6 +17,12 @@ Strict mode is enabled *before* torchvulkan is imported so a silent CPU fallback
 mask backend gaps (repository rule, see AGENTS.md). ``TORCHVULKAN_TEST_DEVICE`` overrides
 the Vulkan device index (e.g. ``TORCHVULKAN_TEST_DEVICE=1`` or ``TORCHVULKAN_TEST_DEVICE=vulkan:1``)
 for machines where device 0 is not the target discrete GPU.
+
+The quantization part (``test_llm_weight_quant*``) runs the same cycle with every block
+linear replaced by a weight-only quant layer driven by the backend's private matmuls
+``torch.ops.torchvulkan.weight_int8_mm`` / ``weight_int4_mm`` — a single quant mode for the
+whole run, so prefill exercises the M>1 dequant+GEMM path and decode the M==1 quant-GEMV
+path of the kernels (operator-level accuracy vs fp64 lives in experiments/test_quant.py).
 """
 
 import importlib.util
@@ -79,11 +85,11 @@ class CachedGPT(GPT):
         vc = [torch.empty(shape, dtype=dtype, device=device) for _ in self.blocks]
         return kc, vc
 
-    def _causal_mask(self, T: int, device: torch.device) -> torch.Tensor:
+    def _causal_mask(self, T: int, device: torch.device, dtype: torch.dtype = torch.float32) -> torch.Tensor:
         """Additive causal mask [1, 1, T, T]: 0 on and below the diagonal, most-negative
-        fp32 above it (the pattern from experiments/vulkan_infer.py)."""
-        m = torch.full((T, T), torch.finfo(torch.float32).min).triu(1)
-        return m.view(1, 1, T, T).to(device)
+        value of ``dtype`` above it (the pattern from experiments/vulkan_infer.py)."""
+        m = torch.full((T, T), torch.finfo(dtype).min).triu(1)
+        return m.view(1, 1, T, T).to(device=device, dtype=dtype)
 
     @torch.no_grad()
     def forward_cache(self, idx, cur, kc, vc, mask=None, timings=None):
@@ -137,14 +143,17 @@ class CachedGPT(GPT):
         return x
 
     @torch.no_grad()
-    def generate_greedy(self, idx, steps: int, timings=None):
+    def generate_greedy(self, idx, steps: int, timings=None, dtype=None):
         """Greedy decode of ``steps`` new tokens: prefill (with a causal mask) then one-token
-        steps against the cache. Returns (tokens [1, steps], prefill_s, decode_step_times)."""
+        steps against the cache. Returns (tokens [1, steps], prefill_s, decode_step_times).
+        ``dtype`` selects the cache/mask dtype; defaults to the model's parameter dtype."""
         dev = idx.device
         sync = torchvulkan.synchronize if dev.type == "vulkan" else (lambda: None)
-        kc, vc = self.init_cache(idx.shape[0], idx.shape[1] + steps, dev)
+        if dtype is None:
+            dtype = self.tok_emb.weight.dtype
+        kc, vc = self.init_cache(idx.shape[0], idx.shape[1] + steps, dev, dtype)
 
-        mask = self._causal_mask(idx.shape[1], dev) if idx.shape[1] > 1 else None
+        mask = self._causal_mask(idx.shape[1], dev, dtype) if idx.shape[1] > 1 else None
 
         sync()
         t0 = time.perf_counter()
@@ -263,3 +272,268 @@ def test_llm_cpu_vs_vulkan_weights_identical():
     for (name, ref_p), (_, vk_p) in zip(reference.state_dict().items(), model.state_dict().items()):
         assert name.split(".")[-1] != "cos" and name.split(".")[-1] != "sin"  # non-persistent buffers
         assert torch.equal(ref_p, vk_p.to("cpu")), f"weight mismatch after transfer: {name}"
+
+
+# =============================================================================================
+# Weight-only quantization (int8 / int4)
+# =============================================================================================
+# The same tiny-GPT cycle with every block linear running through the backend's private
+# weight-only quant matmuls (torch.ops.torchvulkan.weight_int8_mm / weight_int4_mm; kernels
+# in src/api/ops/quant.cpp, shaders in src/shaders/ops/quant_gemv.slang). A single quant
+# mode for the whole run: prefill (M > 1) goes through the kernel's dequant+GEMM path,
+# decode (M == 1) through the quant-GEMV path.
+#
+# torchvulkan/tests/ must not depend on experiments/, so the packing functions below are a
+# minimal value-copy of experiments/quantize.py — that file (and its docstrings) stays the
+# format source of truth:
+#   * int8: one byte per k value, symmetric per-output-row scale, value = (q - 128) * scale,
+#     q in [0, 255] (the -128 offset folded into zero);
+#   * int4: two nibbles per byte (low nibble = even k), asymmetric per-block scale+zero
+#     along K (``group`` k values per group), value = (q - zero) * scale, q in [0, 15];
+#   * int4 rows are zero-padded to a multiple of 16 bytes (wide kernel loads; never read).
+
+ROW_ALIGN = 16  # experiments/quantize.py:ROW_ALIGN — int4 row padding in bytes
+
+
+def quantize_int8(w):
+    """Value-copy of experiments/quantize.py:quantize_int8 (format source of truth):
+    (N, K) -> (uint8 (N, K), float32 scales (N, 1)), symmetric per-row scale."""
+    wf = w.float()
+    amax = wf.abs().amax(dim=1, keepdim=True).clamp_min(1e-12)
+    scales = amax / 127.0
+    q = torch.round(wf / scales).clamp_(-127, 127) + 128
+    return q.to(torch.uint8).contiguous(), scales.contiguous()
+
+
+def quantize_int4(w, group=64):
+    """Value-copy of experiments/quantize.py:quantize_int4 (format source of truth):
+    (N, K) -> (uint8 (N, row_bytes), float32 scales (N, ngroups), float32 zeros (N, ngroups)),
+    asymmetric per-block quantization along K, k-padded to a group multiple and rows
+    padded to ROW_ALIGN."""
+    wf = w.float()
+    N, K = wf.shape
+    Kpad = (K + group - 1) // group * group
+    if Kpad != K:
+        wf = torch.nn.functional.pad(wf, (0, Kpad - K))
+    ngroups = Kpad // group
+
+    blocks = wf.view(N, ngroups, group)
+    wmin = blocks.amin(dim=-1, keepdim=True)
+    wmax = blocks.amax(dim=-1, keepdim=True)
+    scales = ((wmax - wmin) / 15.0).clamp_min(1e-12)
+    zeros = torch.round(-wmin / scales).clamp_(0, 15)
+    q = (torch.round(blocks / scales) + zeros).clamp_(0, 15).view(N, Kpad).to(torch.uint8)
+
+    lo, hi = q[:, 0::2], q[:, 1::2]
+    packed = lo | (hi << 4)  # low nibble = even k
+    row_pad = (-packed.shape[1]) % ROW_ALIGN
+    if row_pad:
+        packed = torch.nn.functional.pad(packed, (0, row_pad))
+    return (packed.contiguous(), scales.view(N, ngroups).contiguous(),
+            zeros.view(N, ngroups).contiguous())
+
+
+class QuantLinear(torch.nn.Module):
+    """Drop-in replacement for an ``nn.Linear`` whose forward dispatches to the backend's
+    private weight-only quant matmul on Vulkan; on CPU (the reference path) it dequantizes
+    and falls back to a plain fp32 matmul — the kernel semantics per
+    experiments/test_quant.py:reference().
+
+    Activations come in ``act_dtype`` (fp16 or fp32), accumulation is fp32 inside the
+    kernel and the output follows the activation dtype. The packed bytes and fp32
+    scales/zeros are kept as *plain attributes* (not buffers/parameters) so
+    ``Module.to()`` never re-casts or re-moves them; weights are quantized on the fly
+    from the fp32 initialisation of the layer being replaced."""
+
+    def __init__(self, linear: torch.nn.Linear, bits: int, group: int = 64,
+                 device="cpu", act_dtype: torch.dtype = torch.float32):
+        super().__init__()
+        assert bits in (4, 8)
+        self.in_features = linear.in_features
+        self.out_features = linear.out_features
+        self.bits = bits
+        self.group = group
+        self.act_dtype = act_dtype
+        if linear.bias is not None:
+            self.bias = torch.nn.Parameter(
+                linear.bias.detach().to(device=device, dtype=act_dtype))
+        else:
+            self.bias = None
+        if bits == 8:
+            packed, scales = quantize_int8(linear.weight.detach())
+            zeros = None
+        else:
+            packed, scales, zeros = quantize_int4(linear.weight.detach(), group)
+        self.w_packed = packed.to(device)
+        self.qscales = scales.to(device)
+        self.qzeros = None if zeros is None else zeros.to(device)
+
+    def dequantized_weight(self) -> torch.Tensor:
+        """Kernel-semantics dequantization to fp32 on CPU (the reference path)."""
+        wi = self.w_packed.detach().cpu().to(torch.int64)
+        sc = self.qscales.detach().cpu()
+        if self.bits == 8:
+            return (wi - 128).float() * sc
+        z = self.qzeros.detach().cpu()
+        ngroups = sc.shape[1]
+        q = torch.stack((wi & 0xF, (wi >> 4) & 0xF), dim=-1).view(wi.shape[0], -1)
+        q = q[:, :ngroups * self.group]
+        deq = (q.view(-1, ngroups, self.group) - z.unsqueeze(-1)) * sc.unsqueeze(-1)
+        return deq.view(wi.shape[0], -1)[:, :self.in_features]
+
+    def forward(self, x):
+        if x.device.type != "vulkan":
+            w = self.dequantized_weight().to(x.dtype)
+            return torch.nn.functional.linear(x, w, self.bias)
+        if self.bits == 8:
+            return torch.ops.torchvulkan.weight_int8_mm(x, self.w_packed, self.qscales, self.bias)
+        return torch.ops.torchvulkan.weight_int4_mm(x, self.w_packed, self.qscales,
+                                                    self.qzeros, self.bias)
+
+
+def quantize_block_linears(model, bits, group=64, device="cpu", act_dtype=torch.float32):
+    """Swap every linear inside ``model.blocks`` for a QuantLinear quantized on the fly
+    from the fp32 initialisation. Embedding, RMSNorm and the tied lm_head stay in
+    floating point (the scheme of experiments/quantize.py:quantize_state_dict)."""
+    for block in model.blocks:
+        block.attn.q = QuantLinear(block.attn.q, bits, group, device, act_dtype)
+        block.attn.kv = QuantLinear(block.attn.kv, bits, group, device, act_dtype)
+        block.attn.out = QuantLinear(block.attn.out, bits, group, device, act_dtype)
+        block.mlp.gate_up = QuantLinear(block.mlp.gate_up, bits, group, device, act_dtype)
+        block.mlp.down = QuantLinear(block.mlp.down, bits, group, device, act_dtype)
+    return model
+
+
+def make_quant_models(device: torch.device, bits: int, act_dtype: torch.dtype = torch.float32):
+    """Three views of the same tiny GPT (identical weights via load_state_dict):
+    the unquantized fp32 CPU reference, the quantized model on CPU (dequant reference
+    path of QuantLinear) and the Vulkan model under test with the same packed weights."""
+    torch.manual_seed(0)
+    fp32_ref = GPT(**CFG).to("cpu").eval()
+    cpu_quant = CachedGPT(**CFG)
+    cpu_quant.load_state_dict(fp32_ref.state_dict())
+    quantize_block_linears(cpu_quant, bits, device="cpu")
+    cpu_quant.eval()
+    vk_quant = CachedGPT(**CFG)
+    vk_quant.load_state_dict(fp32_ref.state_dict())
+    quantize_block_linears(vk_quant, bits, device=device, act_dtype=act_dtype)
+    vk_quant = vk_quant.to(device=device, dtype=act_dtype).eval()
+    return fp32_ref, cpu_quant, vk_quant
+
+
+def time_generate(model, prompt, steps: int = GEN_STEPS):
+    """Wall-clock prefill and mean decode step of one greedy generation (uninstrumented)."""
+    _, prefill_s, step_times = model.generate_greedy(prompt, steps)
+    return prefill_s, sum(step_times) / len(step_times)
+
+
+# Logit tolerances vs the CPU dequant reference: this is kernel error only (the same packed
+# weights on both sides; experiments/test_quant.py measures <= 5e-4 relative at operator
+# level), loosened for the fp16-activation variants where activation rounding adds up.
+QUANT_TOL = {
+    8: dict(rtol=2e-3, atol=2e-3),
+    4: dict(rtol=5e-3, atol=5e-3),
+}
+QUANT_TOL_FP16_ACT = {
+    8: dict(rtol=5e-3, atol=5e-3),
+    4: dict(rtol=1e-2, atol=1e-2),
+}
+
+
+def _assert_finite(t, what):
+    assert torch.isfinite(t).all(), f"{what}: non-finite values"
+
+
+@pytest.mark.parametrize("bits", [8, 4], ids=["int8", "int4"])
+def test_llm_weight_quant(bits):
+    """End-to-end quantized cycle in fp32 activations: prefill logits against the CPU
+    dequant reference (kernel-error tolerance), greedy decode with KV cache against the
+    same reference, run-to-run determinism, all values finite; timings vs fp32 printed."""
+    t_test = time.perf_counter()
+    device = vulkan_device()
+    print(f"\n[int{bits}] vulkan device: {torchvulkan.get_device_name(device)} (index {device.index})")
+
+    fp32_ref, cpu_quant, vk_quant = make_quant_models(device, bits)
+    prompt = make_prompt().to(device)
+    prompt_cpu = prompt.to("cpu")
+
+    # warmup: the first Vulkan call compiles shaders/pipelines (~0.5 s), so time only after it
+    warm_tokens, _, _ = vk_quant.generate_greedy(prompt[:, :2], 2)
+    assert warm_tokens.shape == (1, 2)
+
+    # --- correctness: prefill logits -----------------------------------------------------------
+    logits_deq = cpu_quant(prompt_cpu)[:, -1, :]
+    logits_fp32 = fp32_ref(prompt_cpu)[:, -1, :]
+    prefill_kc, prefill_vc = vk_quant.init_cache(1, PROMPT_LEN, device)
+    logits_vk = vk_quant.forward_cache(prompt, 0, prefill_kc, prefill_vc,
+                                       mask=vk_quant._causal_mask(PROMPT_LEN, device))[:, -1, :]
+    logits_vk = logits_vk.to("cpu")
+    _assert_finite(logits_vk, "prefill logits")
+    err_deq = (logits_vk - logits_deq).abs().max().item()
+    err_fp32 = (logits_vk - logits_fp32).abs().max().item()
+    print(f"prefill logits: max|vulkan-quant - cpu-dequant| = {err_deq:.3e} (asserted), "
+          f"max|vulkan-quant - fp32-unquant| = {err_fp32:.3e} (quantization noise, reported)")
+    torch.testing.assert_close(logits_vk, logits_deq, **QUANT_TOL[bits])
+
+    # --- correctness: greedy decode with KV cache ------------------------------------------------
+    vk_tokens, prefill_s, step_times = vk_quant.generate_greedy(prompt, GEN_STEPS)
+    _assert_finite(vk_tokens, "decode tokens")
+    deq_tokens = greedy_reference(cpu_quant, prompt_cpu, GEN_STEPS)
+    fp32_tokens = greedy_reference(fp32_ref, prompt_cpu, GEN_STEPS)
+    match_deq = torch.equal(vk_tokens.cpu(), deq_tokens)
+    match_fp32 = torch.equal(vk_tokens.cpu(), fp32_tokens)
+    print(f"greedy tokens ({GEN_STEPS} steps) vs cpu-dequant reference: "
+          f"{'MATCH' if match_deq else 'MISMATCH'}")
+    print(f"greedy tokens vs fp32-unquantized reference: "
+          f"{'MATCH' if match_fp32 else 'MISMATCH (quantization noise on a near-tie)'}")
+    print(f"  tokens: {vk_tokens[0].tolist()}")
+    # the exact criterion: the Vulkan quant path implements the dequant semantics
+    torch.testing.assert_close(vk_tokens.cpu(), deq_tokens)
+    # deterministic: the same inputs must give the same tokens on a second run
+    vk_tokens_2, _, _ = vk_quant.generate_greedy(prompt, GEN_STEPS)
+    assert torch.equal(vk_tokens, vk_tokens_2), "quantized generation must be deterministic"
+
+    # --- timings (report only): quant M==1 GEMV / M>1 GEMM paths vs the fp32 baseline ------------
+    fp32_vk = make_models(device)[1]
+    fp32_vk.generate_greedy(prompt[:, :2], 2)  # warmup
+    fp32_prefill, fp32_step = time_generate(fp32_vk, prompt)
+    mean_step = sum(step_times) / len(step_times)
+    print(f"timings (fp32 activations, after warmup; {GEN_STEPS} decode steps):")
+    print(f"  {'mode':<6}{'prefill ms':>12}{'prefill tok/s':>16}"
+          f"{'decode ms/step':>18}{'decode tok/s':>16}")
+    for name, (pf, st) in ((f"int{bits}", (prefill_s, mean_step)), ("fp32", (fp32_prefill, fp32_step))):
+        print(f"  {name:<6}{pf * 1e3:>12.2f}{PROMPT_LEN / pf:>16.1f}"
+              f"{st * 1e3:>18.2f}{1 / st:>16.1f}")
+
+    elapsed = time.perf_counter() - t_test
+    print(f"  total test wall clock: {elapsed:.1f} s")
+    assert elapsed < TOTAL_TIME_BUDGET_S, f"test took {elapsed:.1f} s, budget is {TOTAL_TIME_BUDGET_S:.0f} s"
+
+
+@pytest.mark.parametrize("bits", [8, 4], ids=["int8", "int4"])
+def test_llm_weight_quant_fp16_activations(bits):
+    """fp16 activations exercise the f16 template variants of the quant kernels
+    (quant_gemv_w{8,4}_f16): prefill + a few cached decode steps, logits against the
+    fp32 CPU dequant reference with the fp16 activation rounding folded into the tolerance."""
+    device = vulkan_device()
+    print(f"\n[int{bits} fp16-act] vulkan device: {torchvulkan.get_device_name(device)}")
+    _, cpu_quant, vk_quant = make_quant_models(device, bits, act_dtype=torch.float16)
+    prompt = make_prompt().to(device)
+
+    vk_quant.generate_greedy(prompt[:, :2], 2)  # warmup
+
+    prefill_kc, prefill_vc = vk_quant.init_cache(1, PROMPT_LEN, device, dtype=torch.float16)
+    logits_vk = vk_quant.forward_cache(prompt, 0, prefill_kc, prefill_vc,
+                                       mask=vk_quant._causal_mask(PROMPT_LEN, device, torch.float16)
+                                       )[:, -1, :].to("cpu").float()
+    logits_ref = cpu_quant(prompt.cpu())[:, -1, :]
+    _assert_finite(logits_vk, "prefill logits (fp16 activations)")
+    max_diff = (logits_vk - logits_ref).abs().max().item()
+    print(f"prefill logits: max|vulkan-fp16-quant - cpu-dequant-fp32| = {max_diff:.3e}")
+    torch.testing.assert_close(logits_vk, logits_ref, **QUANT_TOL_FP16_ACT[bits])
+
+    tokens, _, _ = vk_quant.generate_greedy(prompt, 4)
+    assert tokens.shape == (1, 4)  # generate_greedy returns only the generated tokens
+    _assert_finite(tokens, "decode tokens (fp16 activations)")
+    tokens_2, _, _ = vk_quant.generate_greedy(prompt, 4)
+    assert torch.equal(tokens, tokens_2), "fp16-activation generation must be deterministic"
