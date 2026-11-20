@@ -97,7 +97,11 @@ at::Tensor dispatch_quant_gemv(
     const at::Tensor& scales,
     const std::optional<at::Tensor>& zeros,
     const std::optional<at::Tensor>& bias,
-    bool is_int4)
+    bool is_int4,
+    const std::optional<double>& rms_eps,
+    const std::optional<at::Tensor>& rms_w,
+    const std::optional<at::Tensor>& acc,
+    const std::optional<at::Tensor>& x2)
 {
     DeviceContext* device = get_device_context(x);
     const c10::ScalarType x_dtype = x.scalar_type();
@@ -152,14 +156,24 @@ at::Tensor dispatch_quant_gemv(
     pcs.push(get_tensor_address(scales));
     pcs.push(zeros.has_value() ? get_tensor_address(*zeros) : (uint64_t)0);
     pcs.push(hasBias ? get_tensor_address(*bias) : (uint64_t)0);
+    pcs.push(rms_w.has_value() ? get_tensor_address(*rms_w) : (uint64_t)0);
     pcs.push(static_cast<uint32_t>(N));
     pcs.push(static_cast<uint32_t>(K));
     pcs.push(row_stride);
     pcs.push(static_cast<uint32_t>(ngroups));
+    pcs.push(static_cast<float>(rms_eps.value_or(0.0)));
+    pcs.push(rms_eps.has_value() ? 1u : 0u);
+    pcs.push(acc.has_value() ? get_tensor_address(*acc) : (uint64_t)0);
+    pcs.push(x2.has_value() ? get_tensor_address(*x2) : (uint64_t)0);
+    pcs.push(acc.has_value() ? 1u : 0u);
+    pcs.push(x2.has_value() ? 1u : 0u);
 
     std::vector<at::Tensor> readTensors = {x, w_packed, scales};
     if (zeros.has_value()) readTensors.push_back(*zeros);
     if (hasBias) readTensors.push_back(*bias);
+    if (rms_w.has_value()) readTensors.push_back(*rms_w);
+    if (acc.has_value()) readTensors.push_back(*acc);
+    if (x2.has_value()) readTensors.push_back(*x2);
 
     const torchvulkan::Kernel kernel = is_int4 ? torchvulkan::Kernel::QUANT_GEMV_W4 : torchvulkan::Kernel::QUANT_GEMV_W8;
     // aligned path: each subgroup computes one output column
@@ -184,7 +198,11 @@ at::Tensor weight_quant_mm(
     const at::Tensor& scales,
     const std::optional<at::Tensor>& zeros_,
     const std::optional<at::Tensor>& bias_,
-    bool is_int4)
+    bool is_int4,
+    const std::optional<double>& rms_eps_,
+    const std::optional<at::Tensor>& rms_w_,
+    const std::optional<at::Tensor>& acc_,
+    const std::optional<at::Tensor>& x2_)
 {
     check_quant_args(x_, w_packed, scales, zeros_, bias_, is_int4);
 
@@ -207,12 +225,38 @@ at::Tensor weight_quant_mm(
     out_shape.push_back(N);
 
     if (inner != 1) {
+        TORCH_CHECK(!rms_eps_.has_value(), "torchvulkan [ERROR]: rms_eps fusion requires M == 1 activations.");
+        TORCH_CHECK(!acc_.has_value(), "torchvulkan [ERROR]: acc fusion requires M == 1 activations.");
+        TORCH_CHECK(!x2_.has_value(), "torchvulkan [ERROR]: x2 fusion requires M == 1 activations.");
         at::Tensor deq = dequantize_packed(w_packed_c, scales_c, zeros, is_int4, K, x.scalar_type());
         at::Tensor x2d = x.reshape({-1, K});
         return at::matmul(x2d, deq.t()).reshape(out_shape);
     }
 
-    at::Tensor result = dispatch_quant_gemv(x, w_packed_c, scales_c, zeros, bias, is_int4);
+    std::optional<at::Tensor> acc;
+    if (acc_.has_value())
+    {
+        const int64_t B = x.dim() >= 2 ? x.size(0) : 1;
+        TORCH_CHECK(acc_->scalar_type() == x.scalar_type(),
+            "torchvulkan [ERROR]: acc dtype must match activations.");
+        TORCH_CHECK(acc_->numel() == B * N,
+            "torchvulkan [ERROR]: acc must have ", B * N, " elements.");
+        acc = acc_->contiguous();
+    }
+
+    std::optional<at::Tensor> x2;
+    if (x2_.has_value())
+    {
+        TORCH_CHECK(!rms_eps_.has_value(),
+            "torchvulkan [ERROR]: x2 (SwiGLU) and rms fusion are mutually exclusive.");
+        TORCH_CHECK(x2_->scalar_type() == x.scalar_type(),
+            "torchvulkan [ERROR]: x2 dtype must match activations.");
+        TORCH_CHECK(x2_->numel() == x.numel(),
+            "torchvulkan [ERROR]: x2 must have the same element count as activations.");
+        x2 = x2_->contiguous();
+    }
+
+    at::Tensor result = dispatch_quant_gemv(x, w_packed_c, scales_c, zeros, bias, is_int4, rms_eps_, rms_w_, acc, x2_);
     return result.reshape(out_shape);
 }
 
@@ -220,9 +264,13 @@ at::Tensor weight_int8_mm_vulkan(
     const at::Tensor& x,
     const at::Tensor& w_packed,
     const at::Tensor& scales,
-    const std::optional<at::Tensor>& bias)
+    const std::optional<at::Tensor>& bias,
+    const std::optional<double>& rms_eps,
+    const std::optional<at::Tensor>& rms_w,
+    const std::optional<at::Tensor>& acc,
+    const std::optional<at::Tensor>& x2)
 {
-    return weight_quant_mm(x, w_packed, scales, std::nullopt, bias, /*is_int4=*/false);
+    return weight_quant_mm(x, w_packed, scales, std::nullopt, bias, /*is_int4=*/false, rms_eps, rms_w, acc, x2);
 }
 
 at::Tensor weight_int4_mm_vulkan(
@@ -230,9 +278,13 @@ at::Tensor weight_int4_mm_vulkan(
     const at::Tensor& w_packed,
     const at::Tensor& scales,
     const at::Tensor& zeros,
-    const std::optional<at::Tensor>& bias)
+    const std::optional<at::Tensor>& bias,
+    const std::optional<double>& rms_eps,
+    const std::optional<at::Tensor>& rms_w,
+    const std::optional<at::Tensor>& acc,
+    const std::optional<at::Tensor>& x2)
 {
-    return weight_quant_mm(x, w_packed, scales, zeros, bias, /*is_int4=*/true);
+    return weight_quant_mm(x, w_packed, scales, zeros, bias, /*is_int4=*/true, rms_eps, rms_w, acc, x2);
 }
 
 } // namespace
@@ -244,15 +296,19 @@ at::Tensor weight_int4_mm_vulkan(
 namespace torchvulkan {
 
 at::Tensor weight_int8_mm(const at::Tensor& x, const at::Tensor& w_packed, const at::Tensor& scales,
-    const std::optional<at::Tensor>& bias)
+    const std::optional<at::Tensor>& bias, const std::optional<double>& rms_eps,
+    const std::optional<at::Tensor>& rms_w, const std::optional<at::Tensor>& acc,
+    const std::optional<at::Tensor>& x2)
 {
-    return weight_int8_mm_vulkan(x, w_packed, scales, bias);
+    return weight_int8_mm_vulkan(x, w_packed, scales, bias, rms_eps, rms_w, acc, x2);
 }
 
 at::Tensor weight_int4_mm(const at::Tensor& x, const at::Tensor& w_packed, const at::Tensor& scales,
-    const at::Tensor& zeros, const std::optional<at::Tensor>& bias)
+    const at::Tensor& zeros, const std::optional<at::Tensor>& bias, const std::optional<double>& rms_eps,
+    const std::optional<at::Tensor>& rms_w, const std::optional<at::Tensor>& acc,
+    const std::optional<at::Tensor>& x2)
 {
-    return weight_int4_mm_vulkan(x, w_packed, scales, zeros, bias);
+    return weight_int4_mm_vulkan(x, w_packed, scales, zeros, bias, rms_eps, rms_w, acc, x2);
 }
 
 } // namespace torchvulkan

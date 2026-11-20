@@ -8,6 +8,7 @@
 
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -121,7 +122,20 @@ private:
     uint64_t metadata_offset = 0;
 
     static constexpr size_t MIN_PENDING_BYTES_FLUSH_THRESHOLD = 256ull << 20;
-    static constexpr size_t MAX_PENDING_OPS = 512;
+    // batch limit for the lazy submit queue; overridable for latency-sensitive
+    // decode workloads that want one submit per forward pass
+    static size_t maxPendingOps()
+    {
+        static const size_t value = [] {
+            if (const char* env = std::getenv("TORCHVULKAN_MAX_PENDING_OPS")) {
+                char* end = nullptr;
+                unsigned long long parsed = std::strtoull(env, &end, 10);
+                if (end != env && parsed > 0) return static_cast<size_t>(parsed);
+            }
+            return static_cast<size_t>(512);
+        }();
+        return value;
+    }
     std::unordered_set<uint64_t> pending_buffers;
     size_t pending_bytes = 0;
 

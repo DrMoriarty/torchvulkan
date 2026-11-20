@@ -37,7 +37,8 @@ enum class BinaryOp {
     XLOGY = 16,
     LOGADDEXP = 17,
     LOGADDEXP2 = 18,
-    FLOOR_DIVIDE = 19
+    FLOOR_DIVIDE = 19,
+    SILU_MUL = 20 // fused silu(a) * b for the SwiGLU MLP (decode hotpath)
 };
 
 // at::native::alpha_check
@@ -1164,4 +1165,14 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("nextafter.out", &nextafter_out_vulkan);
     m.impl("round.decimals_out", &round_decimals_out_vulkan);
     m.impl("frexp.Tensor_out", &frexp_out_vulkan);
+}
+
+// fused silu(g) * u for the SwiGLU MLP (decode hotpath): one kernel instead of
+// unary silu + binary mul
+at::Tensor torchvulkan::silu_mul_vulkan(const at::Tensor& g, const at::Tensor& u) {
+    at::ScalarType promoted = at::result_type(g, u);
+    auto out = dispatch_binary_shader(g, u, at::Scalar(0), at::Scalar(1), BinaryOp::SILU_MUL, promoted);
+    TORCH_CHECK(out.has_value(), "torchvulkan [ERROR]: silu_mul cannot run on this device/dtype (",
+        promoted, ").");
+    return *out;
 }

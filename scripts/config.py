@@ -209,6 +209,37 @@ KERNELS = [
     Kernel('quant_gemv_w4', 'ops/quant_gemv.slang', [
         Entry('quant_gemv_main', [F16, F32], (), constants=(4,)),
     ]),
+    # fused RMSNorm (statistics in fp32, one subgroup per row, weight applied
+    # in-kernel) and fused rotate-half RoPE for precomputed full-size tables:
+    # one kernel instead of the 9- and 4-kernel aten compositions
+    # two-phase tree argmax/argmin for long reduce dims (vocab-size argmax in
+    # LLM decode): the base arg_reduce scans sequentially with one thread and
+    # costs ~30 ms on a 151936-element fp16 row
+    Kernel('arg_reduce_tree', 'ops/arg_reduce_tree.slang', [
+        Entry('arg_reduce_tree_main', [F16, F32]),
+    ]),
+    Kernel('rms_norm', 'ops/rms_norm.slang', [
+        Entry('rms_norm_main', [F16, F32]),
+    ]),
+    # fused residual-add + RMSNorm with two outputs (sum + normed row) for the
+    # decode hotpath: one kernel instead of aten add + rms_norm
+    Kernel('rms_norm_add', 'ops/rms_norm.slang', [
+        Entry('rms_norm_add_main', [F16, F32]),
+    ]),
+    Kernel('rope_half', 'ops/rope_half.slang', [
+        Entry('rope_half_main', [F16, F32]),
+    ]),
+    # fused per-row RMSNorm + rotate-half RoPE (decode QK stage): one workgroup
+    # of 128 threads per row, rrms in fp32 через groupshared-редукцию
+    Kernel('rms_rope', 'ops/rms_rope.slang', [
+        Entry('rms_rope_main', [F16, F32]),
+    ]),
+    # fused decode attention (T == 1, GQA): QK^T + softmax + P·V in one kernel,
+    # one workgroup of 128 threads per output row, scores in groupshared memory
+    # (cap 4096); WG is a compile-time constant (phase-B reductions walk it)
+    Kernel('attn_decode', 'ops/attn_decode.slang', [
+        Entry('attn_decode_main', [F16], (), constants=(128,)),
+    ]),
     Kernel('conv_128', 'ops/conv.slang', [
         Entry('conv_main', [d for d in FLOATS if d.bytes < 8], ('vec',), constants=(128,)),
     ]),

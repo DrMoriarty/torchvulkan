@@ -45,9 +45,28 @@ at::Tensor sum_vulkan(const at::Tensor& self, c10::optional<at::ScalarType> dtyp
 
 // ops/quant.cpp
 at::Tensor weight_int8_mm(const at::Tensor& x, const at::Tensor& w_packed, const at::Tensor& scales,
-    const c10::optional<at::Tensor>& bias);
+    const c10::optional<at::Tensor>& bias, const c10::optional<double>& rms_eps,
+    const c10::optional<at::Tensor>& rms_w, const c10::optional<at::Tensor>& acc,
+    const c10::optional<at::Tensor>& x2);
 at::Tensor weight_int4_mm(const at::Tensor& x, const at::Tensor& w_packed, const at::Tensor& scales,
-    const at::Tensor& zeros, const c10::optional<at::Tensor>& bias);
+    const at::Tensor& zeros, const c10::optional<at::Tensor>& bias, const c10::optional<double>& rms_eps,
+    const c10::optional<at::Tensor>& rms_w, const c10::optional<at::Tensor>& acc,
+    const c10::optional<at::Tensor>& x2);
+
+// ops/fused.cpp
+at::Tensor rms_norm_fused(const at::Tensor& x, const at::Tensor& w, double eps);
+std::tuple<at::Tensor, at::Tensor> rms_norm_add(const at::Tensor& x1, const at::Tensor& x2,
+    const at::Tensor& w, double eps);
+at::Tensor rope_rotate_half(const at::Tensor& x, const at::Tensor& cos_t, const at::Tensor& sin_t);
+at::Tensor rms_rope(const at::Tensor& x, const at::Tensor& cos_t, const at::Tensor& sin_t,
+    const at::Tensor& w, double eps);
+at::Tensor attn_decode(const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache, int64_t cur,
+    const c10::optional<at::Tensor>& k_cur, const c10::optional<at::Tensor>& v_cur,
+    const c10::optional<at::Tensor>& qkn_w, const c10::optional<at::Tensor>& cos_t,
+    const c10::optional<at::Tensor>& sin_t, const c10::optional<double>& eps);
+
+// ops/binary.cpp
+at::Tensor silu_mul_vulkan(const at::Tensor& g, const at::Tensor& u);
 
 // tensor/allocation.cpp
 void resize_bytes_vulkan(c10::StorageImpl* storage, size_t nbytes);

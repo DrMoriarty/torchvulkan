@@ -26,6 +26,13 @@ __exported import core.dtype;
 [[vk::constant_id(1)]] public const uint IS_ALIGNED = 1;
 [[vk::constant_id(2)]] public const uint HAS_BIAS = 0;
 
+// silu(x) = x * sigmoid(x); fp32-математика (fast-math exp совпадает с aten
+// в пределах допусков — проверено test_quant/test_fused)
+float silu_v(float v)
+{
+    return v / (1.0 + exp(-v));
+}
+
 public struct QuantGemvPushConstants
 {
     public uint64_t tensor_x;      // activations (B, 1, K), T, contiguous
@@ -34,10 +41,17 @@ public struct QuantGemvPushConstants
     public uint64_t tensor_scales; // (N, ngroups), float
     public uint64_t tensor_zeros;  // (N, ngroups), float, int4 only
     public uint64_t tensor_bias;   // (N,), T, optional
+    public uint64_t tensor_rms_w;  // (K,), T: RMSNorm weight applied to activations, 0 = absent
     public uint N;
     public uint K;
     public uint row_stride;        // packed weight row stride in bytes
     public uint ngroups;
+    public float rms_eps;          // fused RMSNorm: rrms = rsqrt(mean(x^2) + eps)
+    public uint rms_flag;          // 1: activations scaled by the in-kernel rrms
+    public uint64_t tensor_acc;    // (B, N), T: residual added to the result, 0 = absent
+    public uint64_t tensor_x2;     // (B, K), T: SwiGLU-пара u; акт = silu(x)*u
+    public uint acc_flag;          // 1: out = acc + GEMV result
+    public uint x2_flag;           // 1: активации = silu(x[k]) * x2[k] (down-proj SwiGLU)
 }
 
 [shader("compute")]
@@ -55,10 +69,13 @@ void quant_gemv_main<T : ITorchVulkan, let PACK : int>(
     T* x = (T*)pcs.tensor_x + uint64_t(b) * pcs.K;
     T* out = (T*)pcs.tensor_out + uint64_t(b) * pcs.N;
     uint8_t* w = (uint8_t*)pcs.tensor_w;
+    T* rms_w = (T*)pcs.tensor_rms_w;
     uint* w32 = (uint*)pcs.tensor_w; // u32 view of the same rows (no pointer bitcast)
     float* scales = (float*)pcs.tensor_scales;
     float* zeros = (float*)pcs.tensor_zeros;
     T* bias = (T*)pcs.tensor_bias;
+    T* acc_in = (T*)pcs.tensor_acc;
+    T* x2 = (T*)pcs.tensor_x2;
 
     uint group = pcs.K / pcs.ngroups; // ngroups == 1 -> group == K, k/group == 0
 
@@ -73,6 +90,26 @@ void quant_gemv_main<T : ITorchVulkan, let PACK : int>(
         if (n >= pcs.N) return;
 
         uint step = lanes * PER_LANE;
+
+        // fused RMSNorm: rrms по активациям считает сам кернел (второй проход
+        // по x — он L1-горячий), вес нормы применяется к активациям поэлементно
+        float rrms = 1.0;
+        if (pcs.rms_flag == 1)
+        {
+            float ss = 0;
+            for (uint k0 = 0; k0 < pcs.K; k0 += step)
+            {
+                uint k = k0 + lane * PER_LANE;
+                [unroll]
+                for (uint j = 0; j < PER_LANE; j++)
+                {
+                    float xv = castValue<T, float>(x[k + j]);
+                    ss += xv * xv;
+                }
+            }
+            ss = WaveActiveSum(ss);
+            rrms = rsqrt(ss / float(pcs.K) + pcs.rms_eps);
+        }
 
         // all math in fp32: Accum for both fp16 and fp32 activations
         float acc = 0;
@@ -93,7 +130,15 @@ void quant_gemv_main<T : ITorchVulkan, let PACK : int>(
             for (uint j = 0; j < PER_LANE; j++)
             {
                 uint q = PACK == 4 ? ((wb >> (4 * j)) & 0xF) : ((wb >> (8 * j)) & 0xFF);
-                dot += (float(q) - z) * castValue<T, float>(x[k + j]);
+                float coef = rrms;
+                if (pcs.tensor_rms_w != 0)
+                    coef *= castValue<T, float>(rms_w[k + j]);
+                float av;
+                if (pcs.x2_flag == 1)
+                    av = silu_v(castValue<T, float>(x[k + j])) * castValue<T, float>(x2[uint64_t(b) * pcs.K + k + j]);
+                else
+                    av = castValue<T, float>(x[k + j]) * coef;
+                dot += (float(q) - z) * av;
             }
             acc += dot * sc;
         }
@@ -102,6 +147,7 @@ void quant_gemv_main<T : ITorchVulkan, let PACK : int>(
         if (lane == 0)
         {
             if (HAS_BIAS == 1) acc += castValue<T, float>(bias[n]);
+            if (pcs.acc_flag == 1) acc += castValue<T, float>(acc_in[uint64_t(b) * pcs.N + n]);
             out[n] = castValue<float, T>(acc);
         }
     }
@@ -112,6 +158,18 @@ void quant_gemv_main<T : ITorchVulkan, let PACK : int>(
         if (n >= pcs.N) return;
 
         uint8_t* wrow = w + uint64_t(n) * pcs.row_stride;
+
+        float rrms = 1.0;
+        if (pcs.rms_flag == 1)
+        {
+            float ss = 0;
+            for (uint k = 0; k < pcs.K; k++)
+            {
+                float xv = castValue<T, float>(x[k]);
+                ss += xv * xv;
+            }
+            rrms = rsqrt(ss / float(pcs.K) + pcs.rms_eps);
+        }
 
         float acc = 0;
         for (uint k = 0; k < pcs.K; k++)
@@ -128,10 +186,21 @@ void quant_gemv_main<T : ITorchVulkan, let PACK : int>(
             }
             uint g = n * pcs.ngroups + k / group;
             float z = PACK == 4 ? zeros[g] : OFFSET;
-            acc += (float(q) - z) * scales[g] * castValue<T, float>(x[k]);
+            float av;
+            if (pcs.x2_flag == 1)
+                av = silu_v(castValue<T, float>(x[k])) * castValue<T, float>(x2[uint64_t(b) * pcs.K + k]);
+            else
+            {
+                float coef = rrms;
+                if (pcs.tensor_rms_w != 0)
+                    coef *= castValue<T, float>(rms_w[k]);
+                av = castValue<T, float>(x[k]) * coef;
+            }
+            acc += (float(q) - z) * scales[g] * av;
         }
 
         if (HAS_BIAS == 1) acc += castValue<T, float>(bias[n]);
+        if (pcs.acc_flag == 1) acc += castValue<T, float>(acc_in[uint64_t(b) * pcs.N + n]);
         out[n] = castValue<float, T>(acc);
     }
 }

@@ -319,7 +319,7 @@ void VulkanShaderManager::flushIfPending()
 {
     // assume active mutex
     bool too_many_bytes = pending_bytes > MIN_PENDING_BYTES_FLUSH_THRESHOLD && pending_bytes > device->memoryBudget() / 4;
-    if (too_many_bytes || operations.size() >= MAX_PENDING_OPS) submit();
+    if (too_many_bytes || operations.size() >= maxPendingOps()) submit();
 }
 
 void VulkanShaderManager::dispatchCopy(

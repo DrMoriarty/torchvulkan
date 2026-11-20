@@ -468,6 +468,64 @@ at::Tensor argreduce(
     if (num_lines == 0) return keepdim ? idx : idx.squeeze(d);
 
     DeviceContext* device = get_device_context(x);
+
+    // fast path: длинный reduce по немногим линиям (vocab-argmax в LLM decode:
+    // [1, 151936] fp16). Базовый arg_reduce сканирует reduce_size ПОСЛЕДОВАТЕЛЬНО
+    // одним потоком (~0.2 мкс/элемент = ~30 мс на vocab) — здесь two-phase tree
+    // reduction (arg_reduce_tree.slang): ~0.3 мс. Семантика (первый экстремум,
+    // NaN побеждает) совпадает с arg_reduce.
+    const bool fast_tree = x.is_contiguous()
+        && (x.scalar_type() == at::kHalf || x.scalar_type() == at::kFloat)
+        && reduce_size >= 2048 && num_lines <= 64;
+    if (fast_tree)
+    {
+        constexpr uint32_t tree_wg = 128;
+        constexpr int64_t chunk_target = 256; // элементов на чанк в фазе 0
+        int64_t n_chunks = std::min<int64_t>((reduce_size + chunk_target - 1) / chunk_target, tree_wg);
+        n_chunks = std::max<int64_t>(n_chunks, 1);
+        const int64_t chunk_size = (reduce_size + n_chunks - 1) / n_chunks;
+        at::Tensor pval = at::empty({num_lines, n_chunks}, x.options());
+        at::Tensor pidx = at::empty({num_lines, n_chunks}, x.options().dtype(at::kLong));
+
+        const uint32_t op_u = static_cast<uint32_t>(op);
+        SpecializationBuilder spd{};
+        spd.push(tree_wg).push(op_u);
+        PushConstantBuilder pcs{};
+        pcs.push(get_tensor_address(x))
+           .push(get_output_address(pval))
+           .push(get_output_address(pidx))
+           .push(get_output_address(idx))
+           .push(static_cast<uint32_t>(num_lines))
+           .push(static_cast<uint32_t>(n_chunks))
+           .push(static_cast<uint32_t>(chunk_size))
+           .push(static_cast<uint32_t>(reduce_size))
+           .push(0u); // phase 0
+        device->shader_manager->dispatchShader(
+            ShaderKey{torchvulkan::Kernel::ARG_REDUCE_TREE, x.scalar_type()},
+            device->default_subgroup_size, spd.build(), pcs.build(),
+            /* read = */ {x}, /* write = */ {pval, pidx},
+            static_cast<uint32_t>(num_lines * n_chunks), 1, 1);
+
+        SpecializationBuilder spd2{};
+        spd2.push(tree_wg).push(op_u);
+        PushConstantBuilder pcs2{};
+        pcs2.push(get_tensor_address(x))
+            .push(get_output_address(pval))
+            .push(get_output_address(pidx))
+            .push(get_output_address(idx))
+            .push(static_cast<uint32_t>(num_lines))
+            .push(static_cast<uint32_t>(n_chunks))
+            .push(static_cast<uint32_t>(chunk_size))
+            .push(static_cast<uint32_t>(reduce_size))
+            .push(1u); // phase 1
+        device->shader_manager->dispatchShader(
+            ShaderKey{torchvulkan::Kernel::ARG_REDUCE_TREE, x.scalar_type()},
+            device->default_subgroup_size, spd2.build(), pcs2.build(),
+            /* read = */ {pval, pidx}, /* write = */ {idx},
+            static_cast<uint32_t>(num_lines), 1, 1);
+
+        return keepdim ? idx : idx.squeeze(d);
+    }
     uint32_t workgroupSizeX = get_dtype_workgroup_size(x.scalar_type(), 1, device);
     ShaderKey shader_key{torchvulkan::Kernel::ARG_REDUCE, x.scalar_type()};
     int32_t ndim32 = static_cast<int32_t>(ndim);

@@ -54,6 +54,13 @@ public struct MulOp<T : ITorchVulkan> : IBinaryOp<T>
     public static T eval(T a, T b, T alpha) { return T.ext_mul(a, b); }
 }
 
+// fused silu(a) * b for the SwiGLU MLP (decode hotpath): one kernel instead of
+// unary silu + binary mul
+public struct SiluMulOp<T : ITorchVulkan> : IBinaryOp<T>
+{
+    public static T eval(T a, T b, T alpha) { return T.ext_mul(T.ext_mul(a, T.ext_sigmoid(a)), b); }
+}
+
 public struct DivOp<T : ITorchVulkan> : IBinaryOp<T>
 {
     public static T eval(T a, T b, T alpha) { return T.ext_div(a, b); }
@@ -234,6 +241,7 @@ public void dispatchBinary<T : ITorchVulkan, let VEC_SIZE : int>(
     case 17: baseBinaryKernel<T, LogaddexpOp<T>, VEC_SIZE>(gi, pcs.tensor_a, pcs.tensor_b, pcs.tensor_out, pcs.metadata, pcs.numel, pcs.alpha, pcs.scalar_value); break;
     case 18: baseBinaryKernel<T, Logaddexp2Op<T>, VEC_SIZE>(gi, pcs.tensor_a, pcs.tensor_b, pcs.tensor_out, pcs.metadata, pcs.numel, pcs.alpha, pcs.scalar_value); break;
     case 19: baseBinaryKernel<T, FloorDivideOp<T>, VEC_SIZE>(gi, pcs.tensor_a, pcs.tensor_b, pcs.tensor_out, pcs.metadata, pcs.numel, pcs.alpha, pcs.scalar_value); break;
+    case 20: baseBinaryKernel<T, SiluMulOp<T>, VEC_SIZE>(gi, pcs.tensor_a, pcs.tensor_b, pcs.tensor_out, pcs.metadata, pcs.numel, pcs.alpha, pcs.scalar_value); break;
     default: break;
     }
 }
