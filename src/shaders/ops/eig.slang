@@ -136,11 +136,13 @@ int2 gebal<T : __BuiltinFloatingPointType>(inout Work<T> w)
         found = false;
         for (int j = l; j >= 1; j--)
         {
-            bool isolated = true;
+            T nonzeros = T(0);
             for (int i = 1; i <= l; i++)
             {
-                if (i != j && w.A(j, i) != T(0)) { isolated = false; break; }
+                T a = w.A(j, i);
+                nonzeros = nonzeros + ((i == j) ? T(0) : abs(a));
             }
+            bool isolated = (nonzeros == T(0));
             if (isolated)
             {
                 exchange<T>(w, j, l, k, l);
@@ -158,11 +160,13 @@ int2 gebal<T : __BuiltinFloatingPointType>(inout Work<T> w)
         found = false;
         for (int j = k; j <= l; j++)
         {
-            bool isolated = true;
+            T nonzeros = T(0);
             for (int i = k; i <= l; i++)
             {
-                if (i != j && w.A(i, j) != T(0)) { isolated = false; break; }
+                T a = w.A(i, j);
+                nonzeros = nonzeros + ((i == j) ? T(0) : abs(a));
             }
+            bool isolated = (nonzeros == T(0));
             if (isolated)
             {
                 exchange<T>(w, j, k, k, l);

@@ -486,7 +486,14 @@ public extension<T : __BuiltinFloatingPointType> T : IDtypeOps
     }
     public static T ext_rsqrt(T a) { return T(1) / ext_sqrt(a); }
     public static T ext_sigmoid(T a) { return T(1) / (T(1) + ext_exp(-a)); }
-    public static T ext_asinh(T a) { if (sizeof(T) == 8) return T(asinh(a.toFloat())); return asinh(a); }
+    // Metal's half asinh is several ulps off (up to ~0.03 relative in the
+    // OpInfo ranges), so sub-fp32 inputs are lifted to fp32 like on CPU
+    public static T ext_asinh(T a)
+    {
+        if (sizeof(T) == 8) return T(asinh(a.toFloat()));
+        if (sizeof(T) < 4) return T(float.ext_asinh(a.toFloat()));
+        return asinh(a);
+    }
     public static T ext_acosh(T a) { if (sizeof(T) == 8) return T(acosh(a.toFloat())); return acosh(a); }
     public static T ext_atanh(T a) { if (sizeof(T) == 8) return T(atanh(a.toFloat())); return atanh(a); }
     // multiplied out: radians()/degrees() have no 64-bit form in SPIR-V

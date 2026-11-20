@@ -60,7 +60,11 @@ T reflectCoordinates<T : __BuiltinFloatingPointType>(T x, int twice_low, int twi
     T sign = T(1);
     if (x < T(0)) { sign = T(-1); x = -x; }
     T extra = fmod(x, span);
-    int flips = toInt<T>(floor(x / span));
+    // derive the flip count from extra, not from floor(x/span): on MoltenVK the
+    // two can disagree when x is an exact multiple of span (floor lands one high,
+    // inverting the parity and reflecting the wrong way); (x-extra)/span is an
+    // exact integer, so rounding it is exact regardless of fmod's rounding
+    int flips = toInt<T>(floor((x - extra) / span + T(0.5)));
     if (flips % 2 == 0) { grad = sign; return extra + lo; }
     grad = -sign;
     return span - extra + lo;

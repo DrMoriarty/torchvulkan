@@ -404,6 +404,15 @@ class TestVulkanOps(TestCase):
                 self.assertEqual(actual, expected, atol=1e-3, rtol=1e-3)
                 continue
 
+            # special.zeta: the CPU reference accumulates Cephes' series in double
+            # (acc_type), the Vulkan kernel in float32; for the large |zeta| the
+            # samples produce (q -> 0+, |zeta| up to ~1e15) the fp32 pow(q, -x)
+            # amplifies its ~1e-7 log/pow error by |x*ln q| and lands at a few
+            # 1e-6 relative — above the default rtol, below anything meaningful
+            elif dtype == torch.float32 and op.name == "special.zeta":
+                self.assertEqual(actual, expected, atol=1e-4, rtol=1e-4)
+                continue
+
             # the backend has no fp64 compute path (transcendentals, reductions and matmul all
             # run in fp32), so any float64 result is at best fp32-accurate
             elif dtype == torch.float64:
