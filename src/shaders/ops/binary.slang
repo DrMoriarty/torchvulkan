@@ -9,6 +9,8 @@ import core.indexing;
 [[vk::constant_id(3)]] public const uint NDIM = 0;
 [[vk::constant_id(4)]] public const uint WG_x = 0;
 [[vk::constant_id(5)]] public const uint HAS_ALPHA = 0;
+// the 16-bit float dtypes round an intermediate through T (host: 1 = half, 2 = bfloat16)
+[[vk::constant_id(6)]] public const uint ROUND_MODE = 0;
 
 public struct Metadata
 {
@@ -18,15 +20,18 @@ public struct Metadata
     public uint64_t strides_out;
 }
 
-public struct BinaryPushConstants<T>
+// the scalar and alpha travel in the accumulate type (float32 for half/bfloat16):
+// a subnormal scalar like 1e-6 would flush to zero as a half, while the CPU's
+// TensorIterator computes scalar ops in opmath float32
+public struct BinaryPushConstants<T : ITorchVulkan>
 {
     public uint64_t tensor_a;
     public uint64_t tensor_b;
     public uint64_t tensor_out;
     public uint64_t metadata;
     public uint64_t numel;
-    public T alpha;
-    public T scalar_value;
+    public T.Accum alpha;
+    public T.Accum scalar_value;
 }
 
 public interface IBinaryOp<T>
@@ -141,6 +146,77 @@ public struct FloorDivideOp<T : ITorchVulkan> : IBinaryOp<T>
     public static T eval(T a, T b, T alpha) { return T.ext_floor_divide(a, b); }
 }
 
+// a round trip through T: for the 16-bit float dtypes this rounds a float32 value to the
+// storage precision; for every other type T.Accum is T itself and this is the identity.
+// The f16/bf16 paths use the BIT conversions: a half cast in registers stays float on
+// Metal and the compiler folds it away, but an integer (the bits) cannot be bypassed
+public extension<T : ITorchVulkan> T
+{
+    public static T.Accum roundToStorage(T.Accum v)
+    {
+        if (ROUND_MODE == 1)
+        {
+            // the f16 bit round trip already leaves the correctly rounded float; a
+            // fromAccum/toAccum tail after it may be folded away, that is harmless
+            T.Accum r = castValue<float, T.Accum>(f16tof32(f32tof16(castValue<T.Accum, float>(v))));
+            T t = T.fromAccum(r);
+            return t.toAccum();
+        }
+        if (ROUND_MODE == 2)
+        {
+            uint bits = asuint(castValue<T.Accum, float>(v));
+            // round to nearest even in the top half, as a float -> bfloat16 cast does
+            bits += 0x7FFF + ((bits >> 16) & 1);
+            T.Accum r = castValue<float, T.Accum>(asfloat(bits & 0xFFFF0000));
+            T t = T.fromAccum(r);
+            return t.toAccum();
+        }
+        T t = T.fromAccum(v);
+        return t.toAccum();
+    }
+}
+
+// the op applied at the accumulate type: for every type whose Accum is T itself
+// this is exactly Op.eval, and for half/bfloat16 (Accum = float32) it is the
+// CPU's opmath computation. Rsub is the CPU's mul+add composite: the alpha-scaled
+// tensor is rounded to T (through_dtype) before the subtraction, as the CPU's
+// intermediate mul result is
+public T.Accum scalarEval<T : ITorchVulkan>(uint op, T.Accum a, T.Accum b, T.Accum alpha)
+{
+    switch (op)
+    {
+    case 0:  return (HAS_ALPHA != 0) ? T.Accum.ext_add(a, T.Accum.ext_mul(alpha, b)) : T.Accum.ext_add(a, b);  // add
+    case 1:  return (HAS_ALPHA != 0) ? T.Accum.ext_sub(a, T.Accum.ext_mul(alpha, b)) : T.Accum.ext_sub(a, b);  // sub
+    case 2:
+    {
+        if (HAS_ALPHA == 0) return T.Accum.ext_sub(b, a);
+        // the CPU's rsub is a mul+add composite: the alpha-scaled tensor rounds to T in
+        // between. The round trip uses the f16 bit conversions — a half cast in registers
+        // stays float on Metal and folds away
+        return T.Accum.ext_sub(b, T.roundToStorage(T.Accum.ext_mul(alpha, a)));
+    }
+    case 3:  return T.Accum.ext_mul(a, b);                                         // mul
+    case 4:  return T.Accum.ext_div(a, b);                                         // div
+    case 5:  return T.Accum.ext_max(a, b);
+    case 6:  return T.Accum.ext_min(a, b);
+    case 7:  return T.Accum.ext_pow(a, b);
+    case 8:  return T.Accum.ext_pow(b, a);
+    case 9:  return T.Accum.ext_atan2(a, b);
+    case 10: return T.Accum.ext_threshold_backward(a, b, alpha);
+    case 11: return T.Accum.ext_fmax(a, b);
+    case 12: return T.Accum.ext_fmin(a, b);
+    case 13: return T.Accum.ext_fmod(a, b);
+    case 14: return T.Accum.ext_remainder(a, b);
+    case 15: return T.Accum.ext_hypot(a, b);
+    case 16: return T.Accum.ext_xlogy(a, b);
+    case 17: return T.Accum.ext_logaddexp(a, b);
+    case 18: return T.Accum.ext_logaddexp2(a, b);
+    case 19: return T.Accum.ext_floor_divide(a, b);
+    case 20: return T.Accum.ext_mul(T.Accum.ext_mul(a, T.Accum.ext_sigmoid(a)), b); // silu_mul
+    default: return a;
+    }
+}
+
 public void baseBinaryKernel<T : ITorchVulkan, Op : IBinaryOp<T>, let VEC_SIZE : int>(
     uint3 gi,
     uint64_t address_a,
@@ -148,10 +224,14 @@ public void baseBinaryKernel<T : ITorchVulkan, Op : IBinaryOp<T>, let VEC_SIZE :
     uint64_t address_out,
     uint64_t address_metadata,
     uint64_t numel,
-    T alpha,
-    T scalar_value)
+    T.Accum alpha,
+    T.Accum scalar_value)
 {
     uint idx = flat_thread(gi, WG_x);
+
+    // the tensor-tensor arithmetic stays in T: alpha converts back to the exact
+    // value a T-typed push constant would have carried
+    T alpha_t = T.fromAccum(alpha);
 
     if (IS_CONTIG != 0)
     {
@@ -179,7 +259,7 @@ public void baseBinaryKernel<T : ITorchVulkan, Op : IBinaryOp<T>, let VEC_SIZE :
                 va[4] = castValue<float, T>(alo.z); va[5] = castValue<float, T>(ahi.z);
                 va[6] = castValue<float, T>(alo.w); va[7] = castValue<float, T>(ahi.w);
 
-                T vb[VEC_SIZE];
+                T vb[VEC_SIZE] = {};
                 if (USE_SCALAR == 0)
                 {
                     uint4 wb = ((uint4*)address_b)[idx];
@@ -190,16 +270,16 @@ public void baseBinaryKernel<T : ITorchVulkan, Op : IBinaryOp<T>, let VEC_SIZE :
                     vb[4] = castValue<float, T>(blo.z); vb[5] = castValue<float, T>(bhi.z);
                     vb[6] = castValue<float, T>(blo.w); vb[7] = castValue<float, T>(bhi.w);
                 }
-                else
-                {
-                    [ForceUnroll] for (int k = 0; k < VEC_SIZE; k++) vb[k] = scalar_value;
-                }
 
                 uint words[4] = { 0, 0, 0, 0 };
                 [ForceUnroll]
                 for (int k = 0; k < VEC_SIZE; k++)
                 {
-                    T r = Op.eval(va[k], vb[k], alpha);
+                    // threshold_backward's alpha (the threshold) must keep its float32 bits
+                    // even in the tensor-tensor path, so it computes at the accumulate type
+                    T r = (USE_SCALAR != 0 || OP_TYPE == 10)
+                        ? T.fromAccum(scalarEval<T>(OP_TYPE, va[k].toAccum(), USE_SCALAR != 0 ? scalar_value : vb[k].toAccum(), alpha))
+                        : Op.eval(va[k], vb[k], alpha_t);
                     uint bits = f32tof16(castValue<T, float>(r));
                     if ((k & 1) == 0) words[k >> 1] = bits;
                     else words[k >> 1] |= bits << 16;
@@ -213,8 +293,10 @@ public void baseBinaryKernel<T : ITorchVulkan, Op : IBinaryOp<T>, let VEC_SIZE :
                 T* tensor_out = (T*)address_out;
                 for (uint i = 0; i < remainder; i++)
                 {
-                    T vb = (USE_SCALAR != 0) ? scalar_value : ((T*)address_b)[base + i];
-                    tensor_out[base + i] = Op.eval(tensor_a[base + i], vb, alpha);
+                    if (USE_SCALAR != 0 || OP_TYPE == 10)
+                        tensor_out[base + i] = T.fromAccum(scalarEval<T>(OP_TYPE, tensor_a[base + i].toAccum(), USE_SCALAR != 0 ? scalar_value : ((T*)address_b)[base + i].toAccum(), alpha));
+                    else
+                        tensor_out[base + i] = Op.eval(tensor_a[base + i], ((T*)address_b)[base + i], alpha_t);
                 }
             }
             return;
@@ -226,17 +308,26 @@ public void baseBinaryKernel<T : ITorchVulkan, Op : IBinaryOp<T>, let VEC_SIZE :
         T va[VEC_SIZE];
         [ForceUnroll] for (int k = 0; k < VEC_SIZE; k++) va[k] = tensor_a[idx * VEC_SIZE + k];
 
-        T vb[VEC_SIZE];
-        [ForceUnroll] for (int k = 0; k < VEC_SIZE; k++) vb[k] = scalar_value;
-
-        if (USE_SCALAR == 0)
+        T res[VEC_SIZE];
+        if (USE_SCALAR != 0 || OP_TYPE == 10)
         {
+            T vb[VEC_SIZE] = {};
+            if (USE_SCALAR == 0)
+            {
+                T* tensor_b = (T*)address_b;
+                [ForceUnroll] for (int k = 0; k < VEC_SIZE; k++) vb[k] = tensor_b[idx * VEC_SIZE + k];
+            }
+            [ForceUnroll] for (int k = 0; k < VEC_SIZE; k++)
+                res[k] = T.fromAccum(scalarEval<T>(OP_TYPE, va[k].toAccum(), USE_SCALAR != 0 ? scalar_value : vb[k].toAccum(), alpha));
+        }
+        else
+        {
+            T vb[VEC_SIZE];
             T* tensor_b = (T*)address_b;
             [ForceUnroll] for (int k = 0; k < VEC_SIZE; k++) vb[k] = tensor_b[idx * VEC_SIZE + k];
-        }
 
-        T res[VEC_SIZE];
-        [ForceUnroll] for (int k = 0; k < VEC_SIZE; k++) res[k] = Op.eval(va[k], vb[k], alpha);
+            [ForceUnroll] for (int k = 0; k < VEC_SIZE; k++) res[k] = Op.eval(va[k], vb[k], alpha_t);
+        }
 
         uint64_t remainder = numel - (idx * VEC_SIZE);
         uint64_t count = (remainder >= VEC_SIZE) ? VEC_SIZE : remainder;
@@ -269,14 +360,22 @@ public void baseBinaryKernel<T : ITorchVulkan, Op : IBinaryOp<T>, let VEC_SIZE :
     }
 
     T v1 = tensor_a[idx_a];
-    T v2 = scalar_value;
-    if (USE_SCALAR == 0)
+    if (USE_SCALAR != 0 || OP_TYPE == 10)
     {
-        T* tensor_b = (T*)address_b;
-        v2 = tensor_b[idx_b];
+        T.Accum v2 = scalar_value;
+        if (USE_SCALAR == 0)
+        {
+            T* tensor_b = (T*)address_b;
+            v2 = tensor_b[idx_b].toAccum();
+        }
+        tensor_out[idx_out] = T.fromAccum(scalarEval<T>(OP_TYPE, v1.toAccum(), v2, alpha));
+        return;
     }
 
-    tensor_out[idx_out] = Op.eval(v1, v2, alpha);
+    T* tensor_b = (T*)address_b;
+    T v2 = tensor_b[idx_b];
+
+    tensor_out[idx_out] = Op.eval(v1, v2, alpha_t);
 }
 
 public void dispatchBinary<T : ITorchVulkan, let VEC_SIZE : int>(

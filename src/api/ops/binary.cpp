@@ -56,6 +56,15 @@ bool is_cpu_scalar(const at::Tensor& t)
     return t.unsafeGetTensorImpl()->is_wrapped_number() || (t.dim() == 0 && t.device().is_cpu());
 }
 
+// the ATen Scalar overloads that wrap the number with the tensor's dtype (add/sub/rsub,
+// fmod/remainder): on the CPU such a scalar is rounded to the dtype before the opmath
+// arithmetic — add/sub round alpha the same way, and an out-of-dtype-range scalar turns inf
+bool wraps_scalar_with_dtype(BinaryOp operation)
+{
+    return operation == BinaryOp::ADD || operation == BinaryOp::SUB || operation == BinaryOp::RSUB ||
+           operation == BinaryOp::FMOD || operation == BinaryOp::REMAINDER;
+}
+
 std::optional<at::Tensor> dispatch_binary_shader(
     const at::Tensor& self,
     const at::Tensor& other,
@@ -110,10 +119,27 @@ std::optional<at::Tensor> dispatch_binary_shader(
        .push(use_scalar ? 1u : 0u)
        .push(out_dims)
        .push(workgroupSizeX)
-       .push(has_alpha);
+       .push(has_alpha)
+       .push(promoted_type == at::kHalf ? 1u : promoted_type == at::kBFloat16 ? 2u : 0u);
 
     MetadataBuilder metadataBuilder = get_iter_metadata(iter, {1, use_scalar ? -1 : 2, 0});
     Metadata metadata = metadataBuilder.build();
+
+    // the shader's alpha and scalar slots hold the accumulate type (float32 for half/bfloat16):
+    // a subnormal scalar like 1e-6 would flush to zero as a half, while the CPU's iterator
+    // computes scalar ops in opmath — same convention as dispatch_addc_shader.
+    // The wrap-ops (wraps_scalar_with_dtype) round the scalar — and, for add/sub/rsub, alpha —
+    // to the dtype on the CPU first; rounding here, on the host, reproduces that exactly
+    // (a subnormal half would flush to zero inside the shader).
+    at::ScalarType scalar_dtype = is_low_prec(promoted_type) ? at::kFloat : promoted_type;
+    bool wraps = is_low_prec(promoted_type) && wraps_scalar_with_dtype(operation);
+    auto through_dtype = [](const at::Scalar& v) {
+        return at::Scalar(static_cast<float>(c10::Half(static_cast<float>(v.toDouble()))));
+    };
+    at::Scalar pushed_alpha = wraps ? through_dtype(alpha) : alpha;
+    at::Scalar pushed_scalar = use_scalar
+        ? (wraps ? through_dtype(scalar) : scalar)
+        : at::Scalar(0);
 
     PushConstantBuilder pcs{};
     pcs.push(addr_a)
@@ -121,8 +147,8 @@ std::optional<at::Tensor> dispatch_binary_shader(
        .push(addr_out)
        .push_metadata(contiguous ? nullptr : &metadata)
        .push(numel)
-       .push_scalar(alpha, promoted_type)
-       .push_operand_scalar(use_scalar ? scalar : at::Scalar(0), promoted_type);
+       .push_scalar(pushed_alpha, scalar_dtype)
+       .push_operand_scalar(pushed_scalar, scalar_dtype);
 
     std::vector<at::Tensor> reads = {a};
     if (!use_scalar) reads.push_back(b);
@@ -229,8 +255,10 @@ at::Tensor binary_op_vulkan(
     // a bool result computes on the raw bytes; other dtypes cast (and so normalize) bools on the way in
     at::Tensor self = at::result_type(self_, other) == at::kBool ? normalize_bool(self_) : self_;
     at::ScalarType promoted = at::result_type(self, other);
-    // the shader takes scalars in the tensor's dtype: one that half or bfloat16 can't hold computes in float32, as the CPU's opmath does
-    if (is_low_prec(promoted) && (!fits_dtype(other, promoted) || !fits_dtype(alpha, promoted))) {
+    // the shader takes scalars in the tensor's dtype: one that half or bfloat16 can't hold computes in float32, as the CPU's opmath does.
+    // the wrap-ops (see dispatch_binary_shader) round the scalar to the dtype on the CPU instead — an out-of-range
+    // value becomes inf there, which the wrapped cast reproduces, so only alpha still escapes to float32
+    if (is_low_prec(promoted) && ((!fits_dtype(other, promoted) && !wraps_scalar_with_dtype(operation)) || !fits_dtype(alpha, promoted))) {
         return binary_op_vulkan(self.to(at::kFloat), other, alpha, operation, fallback).to(promoted);
     }
     std::optional<at::Tensor> out = complex_binary(self, at::Tensor(), &other, alpha, operation, promoted);
