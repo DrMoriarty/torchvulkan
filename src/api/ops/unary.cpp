@@ -97,8 +97,19 @@ at::Tensor unary_op_vulkan(
     }
 
     uint32_t vecSize = get_dtype_vec_size(dtype);
-    uint32_t workgroupSizeX = get_dtype_workgroup_size(dtype, vecSize, device);
     uint32_t contiguous = iter.is_contiguous() ? 1 : 0;
+
+    // wide fp16 variant (A1): contiguous, 16-byte-aligned tensors move 8 halfs
+    // per uint4 load/store instead of vecSize scalar 2-byte ones
+    uint64_t addr_in = get_tensor_address(src);
+    uint64_t addr_out = get_output_address(dst);
+    torchvulkan::Kernel kernel = torchvulkan::Kernel::UNARY;
+    if (dtype == at::kHalf && contiguous && (addr_in & 15) == 0 && (addr_out & 15) == 0) {
+        vecSize = 8;
+        kernel = torchvulkan::Kernel::UNARY_WIDE;
+    }
+
+    uint32_t workgroupSizeX = get_dtype_workgroup_size(dtype, vecSize, device);
 
     SpecializationBuilder spd{};
     spd.push(static_cast<uint32_t>(operation))
@@ -110,14 +121,14 @@ at::Tensor unary_op_vulkan(
     Metadata metadata = metadataBuilder.build();
 
     PushConstantBuilder pcs{};
-    pcs.push(get_tensor_address(src))
-        .push(get_output_address(dst))
+    pcs.push(addr_in)
+        .push(addr_out)
         .push_metadata(contiguous ? nullptr : &metadata)
         .push(numel);
 
     uint64_t threads = contiguous ? (numel + (vecSize - 1)) / vecSize : numel;
     device->shader_manager->dispatchShader(
-        ShaderKey{torchvulkan::Kernel::UNARY, dtype},
+        ShaderKey{kernel, dtype},
         device->default_subgroup_size,
         spd.build(),
         pcs.build(),

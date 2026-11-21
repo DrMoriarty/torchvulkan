@@ -224,9 +224,12 @@ at::Tensor histc_vulkan(const at::Tensor& self, int64_t bins, const at::Scalar& 
     TORCH_CHECK(lo < hi, "torch.histc(): max must be larger than min");
     TORCH_CHECK(std::isfinite(lo) && std::isfinite(hi), "torch.histc(): range of [", lo, ", ", hi, "] is not finite");
 
-    // every step rounded to the input dtype, as the CPU; x == hi goes in the last bin
+    // every step rounded to the input dtype, as the CPU; x == hi goes in the last bin.
+    // span must live on the input's device: a CPU 0-dim span takes the binary scalar
+    // path, where a subnormal scalar (e.g. fp16's 1e-5) is flushed to zero in the
+    // shader and every non-zero element lands in inf/nan bins
     at::Tensor x = self.reshape({-1});
-    at::Tensor span = at::sub(at::scalar_tensor(hi, at::TensorOptions().dtype(self.scalar_type())), at::scalar_tensor(lo, at::TensorOptions().dtype(self.scalar_type())));
+    at::Tensor span = at::sub(at::scalar_tensor(hi, at::TensorOptions().device(self.device()).dtype(self.scalar_type())), at::scalar_tensor(lo, at::TensorOptions().device(self.device()).dtype(self.scalar_type())));
     at::Tensor scaled = at::div(at::mul(at::sub(x, lo), static_cast<double>(bins)), span);
     at::Tensor position = at::clamp_max(at::trunc(scaled).to(at::kLong), bins - 1);
     at::Tensor inside = at::logical_and(at::ge(x, lo), at::le(x, hi));

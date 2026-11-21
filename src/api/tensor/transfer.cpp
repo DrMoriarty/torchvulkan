@@ -29,7 +29,33 @@ void dispatch_copy_shader(const at::Tensor& src, const at::Tensor& dst)
 
     DeviceContext* device = get_device_context(dst);
     ShaderKey shader_key{torchvulkan::Kernel::COPY, get_dtype_width_variant(dst.scalar_type())};
-    uint32_t workgroupSizeX = get_dtype_workgroup_size(dst.scalar_type(), 1, device);
+    uint32_t vecSize = 1;
+    uint64_t threads = numel;
+
+    // wide strided copy for 2-byte element tensors (A1): when the innermost
+    // dimension is contiguous on both sides and every vector's element base
+    // stays 16-byte aligned, move 8 elements per uint4 load/store instead of
+    // scalar 2-byte ones
+    uint64_t addr_in = get_tensor_address(src);
+    uint64_t addr_out = get_output_address(dst);
+    if (c10::elementSize(dst.scalar_type()) == 2 && out_dims >= 1 &&
+        (addr_in & 15) == 0 && (addr_out & 15) == 0)
+    {
+        int64_t inner = iter.shape()[out_dims - 1];
+        bool strides_ok = iter.strides(1)[out_dims - 1] == 1 && iter.strides(0)[out_dims - 1] == 1 &&
+            inner % 8 == 0;
+        for (int32_t d = 0; strides_ok && d < out_dims - 1; d++)
+        {
+            strides_ok = iter.strides(1)[d] % 8 == 0 && iter.strides(0)[d] % 8 == 0;
+        }
+        if (strides_ok)
+        {
+            vecSize = 8;
+            threads = numel / 8;
+            shader_key = ShaderKey{torchvulkan::Kernel::COPY_WIDE, get_dtype_width_variant(dst.scalar_type())};
+        }
+    }
+    uint32_t workgroupSizeX = get_dtype_workgroup_size(dst.scalar_type(), vecSize, device);
 
     SpecializationBuilder spd{};
     spd.push(out_dims)
@@ -39,8 +65,8 @@ void dispatch_copy_shader(const at::Tensor& src, const at::Tensor& dst)
     Metadata metadata = metadataBuilder.build();
 
     PushConstantBuilder pcs{};
-    pcs.push(get_tensor_address(src))
-        .push(get_output_address(dst))
+    pcs.push(addr_in)
+        .push(addr_out)
         .push_metadata(&metadata)
         .push(numel);
 
@@ -51,7 +77,7 @@ void dispatch_copy_shader(const at::Tensor& src, const at::Tensor& dst)
         pcs.build(),
         /* read = */ {src},
         /* write = */ {dst},
-        get_group_count(numel, workgroupSizeX), 1, 1
+        get_group_count(threads, workgroupSizeX), 1, 1
     );
 }
 

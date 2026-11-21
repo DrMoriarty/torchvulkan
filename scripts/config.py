@@ -93,6 +93,15 @@ KERNELS = [
     Kernel('unary', 'ops/unary.slang', [
         Entry('unary_main', DTYPES, ('vec',)),
     ]),
+    # wide fp16 pointwise variants (A1, training_speedup.md): full 128-bit
+    # uint4 loads/stores = 8 halfs per access instead of VEC_SIZE scalar
+    # 2-byte ones; the host routes only contiguous, 16-byte-aligned shapes
+    Kernel('binary_wide', 'ops/binary.slang', [
+        Entry('binary_main', [F16], ('wide_vec',)),
+    ]),
+    Kernel('unary_wide', 'ops/unary.slang', [
+        Entry('unary_main', [F16], ('wide_vec',)),
+    ]),
     Kernel('compare', 'ops/compare.slang', [
         Entry('compare_main', DTYPES, ('vec',)),
     ]),
@@ -107,6 +116,9 @@ KERNELS = [
     ]),
     Kernel('where', 'ops/where.slang', [
         Entry('where_main', DTYPES),
+    ]),
+    Kernel('where_wide', 'ops/where.slang', [
+        Entry('where_main_w', [F16], ('wide_vec',)),
     ]),
     Kernel('addc', 'ops/addc.slang', [
         Entry('addc_main', DTYPES),
@@ -131,6 +143,11 @@ KERNELS = [
     ]),
     Kernel('copy', 'ops/copy.slang', [
         Entry('copy_main', BYTE_WIDTHS),
+    ]),
+    # wide strided copy for 2-byte element tensors: uint4 loads/stores along a
+    # contiguous innermost dimension (host-checked strides and alignment)
+    Kernel('copy_wide', 'ops/copy.slang', [
+        Entry('copy_main_w', [U16], ()),
     ]),
     Kernel('index_gather', 'ops/index_gather.slang', [
         Entry('index_gather_main', BYTE_WIDTHS),

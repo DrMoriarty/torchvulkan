@@ -157,6 +157,69 @@ public void baseBinaryKernel<T : ITorchVulkan, Op : IBinaryOp<T>, let VEC_SIZE :
     {
         if (idx * VEC_SIZE >= numel) return;
 
+        // wide path (VEC_SIZE == 8, 2-byte T, host-checked 16-byte-aligned
+        // addresses): one uint4 = 8 halfs per load/store instead of VEC_SIZE
+        // scalar 2-byte accesses, which is what caps pointwise kernels at
+        // ~25-55 GB/s on MoltenVK (the attn_decode.slang pattern). Arithmetic
+        // stays per-element in T; the f32 round trip of f16tof32/castValue is
+        // exact for values that are halfs to begin with.
+        if (VEC_SIZE == 8 && sizeof(T) == 2)
+        {
+            uint64_t base = idx * VEC_SIZE;
+            uint64_t remainder = numel - base;
+
+            if (remainder >= VEC_SIZE)
+            {
+                uint4 wa = ((uint4*)address_a)[idx];
+                float4 alo = f16tof32(wa);
+                float4 ahi = f16tof32(wa >> 16); // in each word: even dim low, odd dim high
+                T va[VEC_SIZE];
+                va[0] = castValue<float, T>(alo.x); va[1] = castValue<float, T>(ahi.x);
+                va[2] = castValue<float, T>(alo.y); va[3] = castValue<float, T>(ahi.y);
+                va[4] = castValue<float, T>(alo.z); va[5] = castValue<float, T>(ahi.z);
+                va[6] = castValue<float, T>(alo.w); va[7] = castValue<float, T>(ahi.w);
+
+                T vb[VEC_SIZE];
+                if (USE_SCALAR == 0)
+                {
+                    uint4 wb = ((uint4*)address_b)[idx];
+                    float4 blo = f16tof32(wb);
+                    float4 bhi = f16tof32(wb >> 16);
+                    vb[0] = castValue<float, T>(blo.x); vb[1] = castValue<float, T>(bhi.x);
+                    vb[2] = castValue<float, T>(blo.y); vb[3] = castValue<float, T>(bhi.y);
+                    vb[4] = castValue<float, T>(blo.z); vb[5] = castValue<float, T>(bhi.z);
+                    vb[6] = castValue<float, T>(blo.w); vb[7] = castValue<float, T>(bhi.w);
+                }
+                else
+                {
+                    [ForceUnroll] for (int k = 0; k < VEC_SIZE; k++) vb[k] = scalar_value;
+                }
+
+                uint words[4] = { 0, 0, 0, 0 };
+                [ForceUnroll]
+                for (int k = 0; k < VEC_SIZE; k++)
+                {
+                    T r = Op.eval(va[k], vb[k], alpha);
+                    uint bits = f32tof16(castValue<T, float>(r));
+                    if ((k & 1) == 0) words[k >> 1] = bits;
+                    else words[k >> 1] |= bits << 16;
+                }
+                ((uint4*)address_out)[idx] = uint4(words[0], words[1], words[2], words[3]);
+            }
+            else
+            {
+                // tail (< 8 elements left): scalar
+                T* tensor_a = (T*)address_a;
+                T* tensor_out = (T*)address_out;
+                for (uint i = 0; i < remainder; i++)
+                {
+                    T vb = (USE_SCALAR != 0) ? scalar_value : ((T*)address_b)[base + i];
+                    tensor_out[base + i] = Op.eval(tensor_a[base + i], vb, alpha);
+                }
+            }
+            return;
+        }
+
         T* tensor_a = (T*)address_a;
         T* tensor_out = (T*)address_out;
 

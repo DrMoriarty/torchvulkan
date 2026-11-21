@@ -87,8 +87,21 @@ std::optional<at::Tensor> dispatch_binary_shader(
     if (out_dims > MAX_DIMS || !fits_32bit_indexing(iter)) return std::nullopt;
 
     uint32_t vecSize = get_dtype_vec_size(promoted_type);
-    uint32_t workgroupSizeX = get_dtype_workgroup_size(promoted_type, vecSize, device);
     uint32_t contiguous = iter.is_contiguous() ? 1 : 0;
+
+    // wide fp16 variant (A1): contiguous, 16-byte-aligned tensors move 8 halfs
+    // per uint4 load/store instead of vecSize scalar 2-byte ones
+    uint64_t addr_a = get_tensor_address(a);
+    uint64_t addr_b = use_scalar ? 0 : get_tensor_address(b);
+    uint64_t addr_out = get_output_address(out);
+    torchvulkan::Kernel kernel = torchvulkan::Kernel::BINARY;
+    if (promoted_type == at::kHalf && contiguous && (addr_a & 15) == 0 && (addr_out & 15) == 0 &&
+        (use_scalar || (addr_b & 15) == 0)) {
+        vecSize = 8;
+        kernel = torchvulkan::Kernel::BINARY_WIDE;
+    }
+
+    uint32_t workgroupSizeX = get_dtype_workgroup_size(promoted_type, vecSize, device);
     uint32_t has_alpha = (alpha.toDouble() != 1.0) ? 1u : 0u;
 
     SpecializationBuilder spd{};
@@ -103,9 +116,9 @@ std::optional<at::Tensor> dispatch_binary_shader(
     Metadata metadata = metadataBuilder.build();
 
     PushConstantBuilder pcs{};
-    pcs.push(get_tensor_address(a))
-       .push(use_scalar ? uint64_t(0) : get_tensor_address(b))
-       .push(get_output_address(out))
+    pcs.push(addr_a)
+       .push(use_scalar ? uint64_t(0) : addr_b)
+       .push(addr_out)
        .push_metadata(contiguous ? nullptr : &metadata)
        .push(numel)
        .push_scalar(alpha, promoted_type)
@@ -116,7 +129,7 @@ std::optional<at::Tensor> dispatch_binary_shader(
 
     uint64_t threads = contiguous ? (numel + (vecSize - 1)) / vecSize : numel;
     device->shader_manager->dispatchShader(
-        ShaderKey{torchvulkan::Kernel::BINARY, promoted_type},
+        ShaderKey{kernel, promoted_type},
         device->default_subgroup_size,
         spd.build(),
         pcs.build(),

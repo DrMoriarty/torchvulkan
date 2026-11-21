@@ -194,7 +194,21 @@ at::Tensor where_vulkan(
     }
 
     uint32_t contiguous = iter.is_contiguous() ? 1 : 0;
-    uint32_t workgroupSizeX = get_dtype_workgroup_size(promoted, 1, context);
+
+    // wide fp16 variant (A1): contiguous, aligned tensors move 8 elements per
+    // load/store (cond bytes packed in one uint64_t, the halfs in uint4s)
+    uint64_t addr_c = get_tensor_address(c);
+    uint64_t addr_a = get_tensor_address(a);
+    uint64_t addr_b = get_tensor_address(b);
+    uint64_t addr_out = get_output_address(out);
+    torchvulkan::Kernel kernel = torchvulkan::Kernel::WHERE;
+    uint32_t vecSize = 1;
+    if (promoted == at::kHalf && contiguous && (addr_c & 7) == 0 &&
+        (addr_a & 15) == 0 && (addr_b & 15) == 0 && (addr_out & 15) == 0) {
+        vecSize = 8;
+        kernel = torchvulkan::Kernel::WHERE_WIDE;
+    }
+    uint32_t workgroupSizeX = get_dtype_workgroup_size(promoted, vecSize, context);
 
     SpecializationBuilder spd{};
     spd.push(contiguous)
@@ -205,21 +219,22 @@ at::Tensor where_vulkan(
     Metadata metadata = metadataBuilder.build();
 
     PushConstantBuilder pcs{};
-    pcs.push(get_tensor_address(c))
-       .push(get_tensor_address(a))
-       .push(get_tensor_address(b))
-       .push(get_output_address(out))
+    pcs.push(addr_c)
+       .push(addr_a)
+       .push(addr_b)
+       .push(addr_out)
        .push_metadata(contiguous ? nullptr : &metadata)
        .push(numel);
 
+    uint64_t threads = (kernel == torchvulkan::Kernel::WHERE_WIDE) ? (numel + 7) / 8 : numel;
     context->shader_manager->dispatchShader(
-        ShaderKey{torchvulkan::Kernel::WHERE, promoted},
+        ShaderKey{kernel, promoted},
         context->default_subgroup_size,
         spd.build(),
         pcs.build(),
         /* read = */ {c, a, b},
         /* write = */ {out},
-        get_group_count(numel, workgroupSizeX), 1, 1
+        get_group_count(threads, workgroupSizeX), 1, 1
     );
 
     return out;

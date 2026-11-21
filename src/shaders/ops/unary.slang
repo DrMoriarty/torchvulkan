@@ -36,6 +36,47 @@ public void baseUnaryKernel<T : ITorchVulkan, Op : IUnaryOp<T>, let VEC_SIZE : i
     {
         if (idx * VEC_SIZE >= numel) return;
 
+        // wide path (VEC_SIZE == 8, 2-byte T, host-checked 16-byte-aligned
+        // addresses): one uint4 = 8 halfs per load/store instead of VEC_SIZE
+        // scalar 2-byte accesses; see binary.slang for the pattern notes
+        if (VEC_SIZE == 8 && sizeof(T) == 2)
+        {
+            uint64_t base = idx * VEC_SIZE;
+            uint64_t remainder = numel - base;
+
+            if (remainder >= VEC_SIZE)
+            {
+                uint4 w = ((uint4*)address_in)[idx];
+                float4 vlo = f16tof32(w);
+                float4 vhi = f16tof32(w >> 16); // in each word: even dim low, odd dim high
+                T v[VEC_SIZE];
+                v[0] = castValue<float, T>(vlo.x); v[1] = castValue<float, T>(vhi.x);
+                v[2] = castValue<float, T>(vlo.y); v[3] = castValue<float, T>(vhi.y);
+                v[4] = castValue<float, T>(vlo.z); v[5] = castValue<float, T>(vhi.z);
+                v[6] = castValue<float, T>(vlo.w); v[7] = castValue<float, T>(vhi.w);
+
+                uint words[4] = { 0, 0, 0, 0 };
+                [ForceUnroll]
+                for (int k = 0; k < VEC_SIZE; k++)
+                {
+                    T r = Op.eval(v[k]);
+                    uint bits = f32tof16(castValue<T, float>(r));
+                    if ((k & 1) == 0) words[k >> 1] = bits;
+                    else words[k >> 1] |= bits << 16;
+                }
+                ((uint4*)address_out)[idx] = uint4(words[0], words[1], words[2], words[3]);
+            }
+            else
+            {
+                // tail (< 8 elements left): scalar
+                T* tensor_in = (T*)address_in;
+                T* tensor_out = (T*)address_out;
+                for (uint i = 0; i < remainder; i++)
+                    tensor_out[base + i] = Op.eval(tensor_in[base + i]);
+            }
+            return;
+        }
+
         T* tensor_in = (T*)address_in;
         T* tensor_out = (T*)address_out;
 
