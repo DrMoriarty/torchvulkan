@@ -308,7 +308,9 @@ at::Tensor binary_op_vulkan(
 at::Tensor torchvulkan::add_vulkan(const at::Tensor& self, const at::Tensor& other, const at::Scalar& alpha) 
 {    
     alpha_check(at::result_type(self, other), alpha);
-    if (self.scalar_type() == at::kBool) {
+    if (at::result_type(self, other) == at::kBool) {
+        // a bool result keeps the CPU's OR (max) semantics; a bool tensor with an int/float
+        // operand promotes (bool+int -> long, bool+float -> float) and adds arithmetically
         if (alpha.to<bool>() == false) return self.clone();
         return binary_op_vulkan(self, other, alpha, BinaryOp::MAX, [alpha](const at::Tensor& a, const at::Tensor& b) { return at::add(a, b, alpha); });
     }
@@ -345,7 +347,8 @@ namespace {
 at::Tensor add_scalar_vulkan(const at::Tensor& self, const at::Scalar& other, const at::Scalar& alpha) 
 {
     alpha_check(at::result_type(self, other), alpha);
-    if (self.scalar_type() == at::kBool) {
+    if (at::result_type(self, other) == at::kBool) {
+        // see add_vulkan: only a bool result takes the CPU's OR (max) semantics
         if (alpha.to<bool>() == false) return self.clone();
         return binary_op_vulkan(self, other, alpha, BinaryOp::MAX, [alpha](const at::Tensor& a, const at::Scalar& b) { return at::add(a, b, alpha); });
     }
