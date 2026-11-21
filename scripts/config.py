@@ -132,6 +132,14 @@ KERNELS = [
     Kernel('arg_reduce', 'ops/arg_reduce.slang', [
         Entry('arg_reduce_main', DTYPES),
     ]),
+    # two-phase tree sum/prod/amax/amin for long reduce dims on contiguous
+    # fp16/fp32 (full-tensor sum, batch_norm train stats, wgrad chains): the
+    # base reduce scans per-thread chunks with uncoalesced lanes (~4 GB/s);
+    # fp32 accumulation for every input dtype, partials/output fp32 (A2,
+    # training_speedup.md)
+    Kernel('reduce_tree', 'ops/reduce_tree.slang', [
+        Entry('reduce_tree_main', [F16, F32]),
+    ]),
     Kernel('scan', 'ops/scan.slang', [
         Entry('scan_main', DTYPES),
     ]),

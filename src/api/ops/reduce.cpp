@@ -23,6 +23,22 @@ enum class ReduceOp {
     PROD = 3
 };
 
+// Tree-reduction fast path (reduce_tree.slang, A2 in experiments/training_speedup.md):
+// two-phase workgroup-tree for long reduce dims on contiguous fp16/fp32 — the
+// base reduce kernel scans per-thread chunks with warp lanes megabytes apart
+// (~4 GB/s), the tree path reads coalesced uint4-wide and accumulates in fp32.
+// Always returns the reduction in fp32 (the accumulate dtype), so it is only
+// reachable for callers whose contract is the accumulate dtype: fp32 tensors
+// (via dispatch_reduce_shader, any op) and fp16 sum/prod (via the
+// accumulate-aware callers below, which would otherwise materialise an fp32
+// copy that costs more than the reduction itself). nullopt = not applicable,
+// the caller must use the base kernel.
+std::optional<at::Tensor> tree_reduce_vulkan(
+    const at::Tensor& self,
+    int64_t dim,
+    bool keepdim,
+    ReduceOp operation);
+
 at::Tensor dispatch_reduce_shader(
     const at::Tensor& self,
     int64_t dim,
@@ -36,6 +52,8 @@ at::Tensor dispatch_reduce_shader(
 
     dim = c10::maybe_wrap_dim(dim, ndim);
     TORCH_CHECK(ndim <= MAX_DIMS, "torchvulkan [ERROR]: Tensor rank (", ndim, ") exceeds the maximum supported (", MAX_DIMS, ").");
+
+    if (auto fast = tree_reduce_vulkan(self, dim, keepdim, operation)) return *fast;
 
     std::vector<int64_t> out_sizes(self.sizes().begin(), self.sizes().end());
     int64_t reduce_size = out_sizes[dim];
@@ -57,13 +75,22 @@ at::Tensor dispatch_reduce_shader(
         c10::elementSize(stype) <= 4 &&
         (!dtype_needs_extended || device->support_subgroup_extended_types);
 
+    // flat_group() (indexing.slang) folds the y dimension into the group id
+    // (group.y * GROUP_ROW + group.x), so the wave count is not bounded by
+    // maxComputeWorkGroupCount[0]: rows beyond it go into group.y. Without
+    // this, e.g. batch_norm's mean over {0,2,3} of [N,C,H,W] (numel_out =
+    // N*C*H waves) silently lost the coalesced subgroup kernel to the
+    // thread-per-chunk REDUCE one (~6% of the bandwidth).
+    const uint64_t max_groups_x = device->properties.limits.maxComputeWorkGroupCount[0];
+    const uint64_t max_groups_y = device->properties.limits.maxComputeWorkGroupCount[1];
+    const uint64_t groups_row = std::min<uint64_t>(GROUP_ROW, max_groups_x);
     bool use_subgroup =
         has_subgroup &&
         device->support_subgroup_arithmetic &&
         device->default_subgroup_size > 0 &&
         dtype_supported_subgroup &&
         reduce_size >= static_cast<int64_t>(device->default_subgroup_size) &&
-        numel_out <= static_cast<uint64_t>(device->properties.limits.maxComputeWorkGroupCount[0]);
+        numel_out <= groups_row * max_groups_y;
 
     uint32_t workgroupSizeX = use_subgroup ? device->default_subgroup_size : get_dtype_workgroup_size(stype, 1, device);
 
@@ -101,7 +128,17 @@ at::Tensor dispatch_reduce_shader(
        .push(chunk);
 
     uint64_t work_items = numel_out * split;
-    uint32_t groupX = use_subgroup ? static_cast<uint32_t>(work_items) : get_group_count(work_items, workgroupSizeX);
+    uint32_t groupX, groupY = 1;
+    if (use_subgroup) {
+        if (work_items <= max_groups_x) {
+            groupX = static_cast<uint32_t>(work_items);
+        } else {
+            groupX = static_cast<uint32_t>(groups_row);
+            groupY = static_cast<uint32_t>((work_items + groups_row - 1) / groups_row);
+        }
+    } else {
+        groupX = get_group_count(work_items, workgroupSizeX);
+    }
 
     device->shader_manager->dispatchShader(
         ShaderKey{kernel, stype},
@@ -110,7 +147,7 @@ at::Tensor dispatch_reduce_shader(
         pcs.build(),
         /* read = */ {self},
         /* write = */ {partial},
-        groupX, 1, 1
+        groupX, groupY, 1
     );
 
     if (split > 1) {
@@ -262,6 +299,186 @@ at::Tensor reduce_dims_vulkan(
     return unview(result);  // the shader's output reshaped (a full reduction's [1] as []) is still a new tensor
 }
 
+// ---- tree-reduction fast path (A2, experiments/training_speedup.md) ----
+
+// a contiguous tensor is viewable as (num_lines, reduce_size) with every line
+// contiguous when the reduced dim is the LAST meaningful one (size-1 dims
+// after it keep the layout): line l is then the flat range
+// [l*reduce_size, (l+1)*reduce_size). Reducing a leading dim of e.g. [N, C]
+// gives strided column lines — that layout stays on the base kernel.
+bool tree_line_layout(const at::Tensor& self, int64_t dim, int64_t& num_lines, int64_t& reduce_size)
+{
+    int64_t ndim = self.dim();
+    reduce_size = self.size(dim);
+    if (reduce_size <= 0) return false;
+    for (int64_t d = dim + 1; d < ndim; d++) {
+        if (self.size(d) != 1) return false;
+    }
+    num_lines = self.numel() / reduce_size;
+    return true;
+}
+
+std::optional<at::Tensor> tree_reduce_vulkan(
+    const at::Tensor& self,
+    int64_t dim,
+    bool keepdim,
+    ReduceOp operation)
+{
+    at::ScalarType stype = self.scalar_type();
+    if (stype != at::kFloat && stype != at::kHalf) return std::nullopt;
+    // fp16 приходит только от accumulate-aware вызовов (sum/prod ждут fp32);
+    // amax/amin на fp16 остаются на базовом кернеле — их контракт требует
+    // выход во входном dtype
+    if (stype == at::kHalf && operation != ReduceOp::SUM && operation != ReduceOp::PROD) return std::nullopt;
+    if (!self.is_contiguous() || self.dim() == 0 || self.numel() == 0 || self.dim() > MAX_DIMS) return std::nullopt;
+    if (!fits_32bit_indexing({self})) return std::nullopt;
+
+    int64_t num_lines = 0, reduce_size = 0;
+    if (!tree_line_layout(self, dim, num_lines, reduce_size)) return std::nullopt;
+
+    DeviceContext* device = get_device_context(self);
+    const uint64_t max_groups_x = device->properties.limits.maxComputeWorkGroupCount[0];
+    const uint64_t max_groups_y = device->properties.limits.maxComputeWorkGroupCount[1];
+    const uint64_t groups_row = std::min<uint64_t>(GROUP_ROW, max_groups_x);
+    // строк больше, чем влезает в сетку фазы 0, — базовый путь
+    if (num_lines > static_cast<int64_t>(groups_row * max_groups_y)) return std::nullopt;
+    // ниже 32 элементов в строке (WG/4) строка-параллельный WG-режим не
+    // окупает запуск — остаётся базовый кернел
+    constexpr int64_t MIN_REDUCE = 32;
+    if (reduce_size < MIN_REDUCE) return std::nullopt;
+
+    constexpr uint32_t tree_wg = 128;
+    constexpr int64_t chunk_target = 256;    // элементов на чанк в фазе 0 (как у arg_reduce_tree)
+    constexpr int64_t grid_target = 4096;    // WG фазы 0 суммарно
+    int64_t n_chunks, chunk_size;
+    if (reduce_size >= 2048) {
+        n_chunks = std::min<int64_t>((reduce_size + chunk_target - 1) / chunk_target,
+                                     (grid_target + num_lines - 1) / num_lines);
+        n_chunks = std::min<int64_t>(std::max<int64_t>(n_chunks, 1), static_cast<int64_t>(tree_wg));
+        // chunk_size кратен 16 элементам — выравнивание векторной ветки шейдера
+        chunk_size = (reduce_size + n_chunks - 1) / n_chunks;
+        chunk_size = (chunk_size + 15) / 16 * 16;
+        n_chunks = (reduce_size + chunk_size - 1) / chunk_size;
+    } else {
+        // короткий reduce (batch_norm-статистика по {0,2,3} и т.п.): один WG
+        // на строку, фаза 1 не нужна
+        n_chunks = 1;
+        chunk_size = reduce_size;
+    }
+    const bool direct = n_chunks == 1;
+
+    at::Tensor partial = direct ? at::Tensor()
+                                : at::empty({num_lines, n_chunks}, self.options().dtype(at::kFloat));
+    at::Tensor out = at::empty({num_lines}, self.options().dtype(at::kFloat));
+    at::Tensor& phase0_out = direct ? out : partial;
+
+    // WG прямого режима = pow2(rs): при короткой строке не запускаем 128
+    // потоков ради 32 элементов; чанченный режим и фаза 1 — 128
+    uint32_t wg0 = tree_wg;
+    if (direct && reduce_size <= static_cast<int64_t>(tree_wg)) {
+        wg0 = 16;
+        while (wg0 < reduce_size) wg0 <<= 1;
+    }
+
+    const uint32_t op_u = static_cast<uint32_t>(operation);
+    SpecializationBuilder spd{};
+    spd.push(wg0).push(op_u);
+    PushConstantBuilder pcs{};
+    pcs.push(get_tensor_address(self))
+       .push(get_output_address(phase0_out))
+       .push(get_output_address(out))
+       .push(static_cast<uint32_t>(num_lines))
+       .push(static_cast<uint32_t>(n_chunks))
+       .push(static_cast<uint32_t>(chunk_size))
+       .push(static_cast<uint32_t>(reduce_size))
+       .push(0u); // phase 0
+
+    // сетка фазы 0: строки-чанки плоско (flat_group в шейдере складывает y);
+    // в прямом режиме строк может быть больше maxComputeWorkGroupCount[0]
+    uint64_t work_items = static_cast<uint64_t>(num_lines) * n_chunks;
+    uint32_t groupX = static_cast<uint32_t>(std::min<uint64_t>(work_items, groups_row));
+    uint32_t groupY = static_cast<uint32_t>((work_items + groups_row - 1) / groups_row);
+
+    device->shader_manager->dispatchShader(
+        ShaderKey{torchvulkan::Kernel::REDUCE_TREE, stype},
+        device->default_subgroup_size, spd.build(), pcs.build(),
+        /* read = */ {self}, /* write = */ {phase0_out},
+        groupX, groupY, 1);
+
+    if (!direct)
+    {
+        SpecializationBuilder spd2{};
+        spd2.push(tree_wg).push(op_u);
+        PushConstantBuilder pcs2{};
+        pcs2.push(get_tensor_address(self))
+            .push(get_output_address(partial))
+            .push(get_output_address(out))
+            .push(static_cast<uint32_t>(num_lines))
+            .push(static_cast<uint32_t>(n_chunks))
+            .push(static_cast<uint32_t>(0))
+            .push(static_cast<uint32_t>(reduce_size))
+            .push(1u); // phase 1
+        device->shader_manager->dispatchShader(
+            ShaderKey{torchvulkan::Kernel::REDUCE_TREE, stype},
+            device->default_subgroup_size, spd2.build(), pcs2.build(),
+            /* read = */ {partial}, /* write = */ {out},
+            static_cast<uint32_t>(num_lines), 1, 1);
+    }
+
+    std::vector<int64_t> out_sizes(self.sizes().begin(), self.sizes().end());
+    out_sizes[dim] = 1;
+    at::Tensor shaped = out.view(out_sizes);
+    return keepdim ? std::optional<at::Tensor>(shaped) : shaped.squeeze(dim);
+}
+
+double reduce_empty_value(ReduceOp operation)
+{
+    switch (operation) {
+        case ReduceOp::SUM:  return 0.0;
+        case ReduceOp::PROD: return 1.0;
+        case ReduceOp::AMAX: return -std::numeric_limits<double>::infinity();
+        case ReduceOp::AMIN: return std::numeric_limits<double>::infinity();
+    }
+    return 0.0;
+}
+
+// fp16-вход с fp32-накоплением (sum/prod): применяет tree-редукцию к старшим
+// dim, пока она применима, остаток reduce-размерностей — базовым путём уже на
+// fp32-результате. Undefined, если дерево не взяло ни одного dim.
+at::Tensor tree_reduce_accumulated(
+    const at::Tensor& self,
+    at::OptionalIntArrayRef dims,
+    bool keepdim,
+    ReduceOp operation)
+{
+    std::vector<int64_t> dim_list;
+    if (dims.has_value() && dims->size() > 0) {
+        for (int64_t d : *dims) dim_list.push_back(c10::maybe_wrap_dim(d, self.dim()));
+    } else {
+        for (int64_t d = 0; d < self.dim(); d++) dim_list.push_back(d);
+    }
+    std::sort(dim_list.begin(), dim_list.end(), std::greater<int64_t>());
+    if (dim_list.empty()) return at::Tensor();
+
+    at::Tensor result = self;
+    size_t taken = 0;
+    for (; taken < dim_list.size(); taken++)
+    {
+        std::optional<at::Tensor> fast = tree_reduce_vulkan(result, dim_list[taken], keepdim, operation);
+        if (!fast.has_value()) break;
+        result = *fast;
+    }
+    if (taken == 0) return at::Tensor();
+    if (taken < dim_list.size())
+    {
+        // сняты только старшие dim — индексы остальных остались валидными
+        std::vector<int64_t> rest(dim_list.begin() + taken, dim_list.end());
+        result = reduce_dims_vulkan(result, at::IntArrayRef(rest), keepdim, operation,
+                                    reduce_empty_value(operation), true);
+    }
+    return result;
+}
+
 // the sum in its accumulation dtype (float32 for half and bfloat16), before it's cast to the output dtype
 at::Tensor sum_accumulated(
     const at::Tensor& self,
@@ -269,8 +486,16 @@ at::Tensor sum_accumulated(
     bool keepdim,
     at::ScalarType out_dtype)
 {
-    at::Tensor acc = self.to(reduce_accumulate_dtype(out_dtype));
-    return reduce_dims_vulkan(acc, dim, keepdim, ReduceOp::SUM, 0.0, true);
+    at::ScalarType acc = reduce_accumulate_dtype(out_dtype);
+    if (acc != self.scalar_type() && self.scalar_type() == at::kHalf)
+    {
+        // дерево читает half напрямую с fp32-накоплением — материализованная
+        // fp32-копия базового пути стоит дороже самой редукции
+        at::Tensor fast = tree_reduce_accumulated(self, dim, keepdim, ReduceOp::SUM);
+        if (fast.defined()) return fast;
+    }
+    at::Tensor acc_t = self.to(acc);
+    return reduce_dims_vulkan(acc_t, dim, keepdim, ReduceOp::SUM, 0.0, true);
 }
 
 at::Tensor sum_dim_vulkan(
@@ -335,6 +560,11 @@ at::Tensor prod_dim_vulkan(
 {
     at::Tensor self_typed = self.to(reduce_compute_dtype(self, dtype));
     at::ScalarType out_dtype = self_typed.scalar_type();
+    if (self_typed.scalar_type() == at::kHalf)
+    {
+        at::Tensor fast = tree_reduce_accumulated(self_typed, at::IntArrayRef{dim}, keepdim, ReduceOp::PROD);
+        if (fast.defined()) return fast.to(out_dtype);
+    }
     at::Tensor acc = self_typed.to(reduce_accumulate_dtype(out_dtype));
 
     return reduce_dims_vulkan(acc, at::IntArrayRef{dim}, keepdim, ReduceOp::PROD, 1.0, false).to(out_dtype);
@@ -346,6 +576,11 @@ at::Tensor prod_vulkan(
 {
     at::Tensor self_typed = self.to(reduce_compute_dtype(self, dtype));
     at::ScalarType out_dtype = self_typed.scalar_type();
+    if (self_typed.scalar_type() == at::kHalf)
+    {
+        at::Tensor fast = tree_reduce_accumulated(self_typed, at::OptionalIntArrayRef(), /*keepdim=*/false, ReduceOp::PROD);
+        if (fast.defined()) return fast.to(out_dtype);
+    }
     at::Tensor acc = self_typed.to(reduce_accumulate_dtype(out_dtype));
 
     return reduce_dims_vulkan(acc, at::OptionalIntArrayRef(), false, ReduceOp::PROD, 1.0, false).to(out_dtype);
