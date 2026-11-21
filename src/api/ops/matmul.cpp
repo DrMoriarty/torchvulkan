@@ -1,5 +1,6 @@
 #include <torch/extension.h>
 #include <c10/core/MemoryFormat.h>
+#include <cstdlib>
 #include <functional>
 #include "vulkan/memory.h"
 #include "vulkan/vulkan_context.h"
@@ -332,6 +333,122 @@ at::Tensor dispatch_matmul_simd_shader(
         return cpu_fallback();
     }
 
+    torchvulkan::Kernel kernel = tile_m == 128 ? torchvulkan::Kernel::MATMUL_SIMD_128 : torchvulkan::Kernel::MATMUL_SIMD_64;
+
+    // split-K for underfilled grids: when the tile grid amounts to only a few
+    // workgroups (small M and/or N against a large K), the k range is split
+    // into chunks, one matmul per chunk produces a partial [s, M, N] result and
+    // the partials are folded pairwise — the same shape as the coopmat path's
+    // split-K. Batches don't split: the batch already fills the grid's z
+    // dimension. Partial matmuls run on as_strided chunk views, so no input
+    // copy is needed.
+    const uint32_t vecSize = get_dtype_vec_size(result_dtype);
+    // tuning knob for the split-K heuristic (0 disables splitting)
+    static const uint32_t target_grid = [] {
+        const char* env = std::getenv("TORCHVULKAN_MM_SPLIT_MAX");
+        return env ? (uint32_t)std::atoi(env) : 256;
+    }();
+    uint32_t grid = ((M + tile_m - 1) / tile_m) * ((N + TILE_N - 1) / TILE_N) * (uint32_t)B;
+    uint32_t split = 1;
+    // the fold costs ~0.1 ms per extra dispatch and the partial pass writes the
+    // result once more, so splitting only pays off once the GEMM itself is large
+    // enough for the grid fill to matter (below ~2 GFLOP the underfilled kernel
+    // is already fast and the overhead is a net loss)
+    uint64_t gemm_flops = 2ULL * M * K * N;
+    if (B == 1 && grid < target_grid && K >= 512 && gemm_flops >= 2000000000ULL) {
+        while (
+            split * 2 * grid <= target_grid &&
+            (K % (split * 2 * vecSize)) == 0 && (K / (split * 2)) >= 256
+        ) {
+            split *= 2;
+        }
+    }
+
+    if (split > 1) {
+        at::Tensor a2 = shape.self.reshape({(int64_t)M, (int64_t)K});
+        at::Tensor b2 = shape.other.reshape({(int64_t)K, (int64_t)N});
+        int64_t ks = K / split;
+        at::Tensor a_chunks = a2.as_strided({split, (int64_t)M, ks}, {ks * a2.stride(1), a2.stride(0), a2.stride(1)});
+        at::Tensor b_chunks = b2.as_strided({split, ks, (int64_t)N}, {ks * b2.stride(0), b2.stride(0), b2.stride(1)});
+        at::Tensor partial = at::empty({(int64_t)split, (int64_t)M, (int64_t)N}, a2.options());
+
+        if (fits_32bit_indexing({a_chunks, b_chunks, partial})) {
+            // the kernel's aligned mode only assumes unit col strides; the row
+            // and batch strides travel through the push constants, so the
+            // strided chunks keep the aligned loads as long as the chunk tails
+            // stay vector-multiples (the split loop guarantees it for k, N is
+            // checked here)
+            uint32_t chunks_aligned = (N % vecSize == 0) &&
+                a_chunks.stride(2) == 1 && b_chunks.stride(2) == 1 ? 1 : 0;
+
+            SpecializationBuilder spd{};
+            spd.push(WG)
+               .push(WG)
+               .push(chunks_aligned)
+               .push(uint32_t(0)) // HAS_BIAS
+               .push(uint32_t(0)); // ACTIVATION
+            SpecializationArgs specialization = spd.build();
+
+            auto chunk_strides_of = [](const at::Tensor& t, uint32_t (&strides)[4]) {
+                for (int i = 0; i < 3; i++) strides[i] = static_cast<uint32_t>(t.stride(i));
+                strides[3] = 0;
+            };
+            uint32_t strides_a[4], strides_b[4], strides_c[4];
+            chunk_strides_of(a_chunks, strides_a);
+            chunk_strides_of(b_chunks, strides_b);
+            chunk_strides_of(partial, strides_c);
+
+            materialize_cow(partial);
+            PushConstantBuilder pcs{};
+            pcs.push(get_tensor_address(a_chunks));
+            pcs.push(get_tensor_address(b_chunks));
+            pcs.push(get_tensor_address(partial));
+            pcs.push((uint64_t)0); // no bias in the partials
+            pcs.push_array(strides_a);
+            pcs.push_array(strides_b);
+            pcs.push_array(strides_c);
+            uint32_t strides_bias[4] = {0, 0, 0, 0};
+            pcs.push_array(strides_bias);
+            pcs.push(M);
+            pcs.push(N);
+            pcs.push(static_cast<uint32_t>(ks));
+            pcs.push((uint32_t)0);
+            pcs.push_scalar(alpha, compute_type);
+            pcs.push_scalar(0, compute_type); // beta folds in on the host
+
+            device->shader_manager->dispatchShader(
+                ShaderKey{kernel, result_dtype},
+                device->default_subgroup_size,
+                specialization,
+                pcs.build(),
+                /* read = */ {a_chunks, b_chunks},
+                /* write = */ {partial},
+                (N + TILE_N - 1) / TILE_N, (M + tile_m - 1) / tile_m, split
+            );
+
+            // pairwise fold, as in the coopmat path: each partial is already
+            // rounded to the result dtype by the shader's store, and the fp32
+            // accumulate type would need a materialized fp32 copy per partial —
+            // measured on MoltenVK, that copy plus fp32 adds costs more than the
+            // whole GEMM gain, while the fp16 pairwise tree stays within one
+            // extra rounding per level (~6e-4 on randn, bit-exact with CPU)
+            at::Tensor reduced = partial;
+            for (int64_t s = split / 2; s >= 1; s /= 2) {
+                reduced = torchvulkan::add_vulkan(reduced.narrow(0, 0, s), reduced.narrow(0, s, s), 1);
+            }
+            reduced = reduced.reshape({(int64_t)M, (int64_t)N});
+
+            if (has_bias) {
+                at::Tensor bias_2d = bias_.to(result_dtype);
+                if (bias_2d.dim() != 2 || bias_2d.size(0) != (int64_t)M || bias_2d.size(1) != (int64_t)N) {
+                    bias_2d = bias_2d.expand({(int64_t)M, (int64_t)N});
+                }
+                reduced = torchvulkan::add_vulkan(reduced, bias_2d, beta);
+            }
+            return finish_matmul_output(apply_matmul_activation(reduced, activation), shape);
+        }
+    }
+
     MatmulOperands ops = prepare_matmul_operands(shape.self, shape.other, bias_, has_bias, result_dtype, M, K, N, B, shape.batch_shape);
     at::Tensor out = at::empty({B, M, N}, ops.self_b.options());
 
@@ -345,8 +462,6 @@ at::Tensor dispatch_matmul_simd_shader(
         return cpu_fallback();
     }
 
-    torchvulkan::Kernel kernel = tile_m == 128 ? torchvulkan::Kernel::MATMUL_SIMD_128 : torchvulkan::Kernel::MATMUL_SIMD_64;
-    uint32_t vecSize = get_dtype_vec_size(result_dtype);
     uint32_t isBiasAligned = has_bias ? ops.bias_b.is_contiguous() : 1;
     uint32_t isAligned = (K % vecSize == 0) && (N % vecSize == 0) &&
                          ops.self_b.is_contiguous() && ops.other_b.is_contiguous() && isBiasAligned;
