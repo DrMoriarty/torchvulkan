@@ -33,6 +33,11 @@ public struct MatmulPushConstants<T>
     public uint padding;
     public T alpha;
     public T beta;
+    // dual-output gelu epilogue (ACTIVATION == 3, training hotpath Б1): the raw
+    // GEMM (+bias) result lands here — the pre-activation the backward's
+    // gelu_backward reads — while tensor_out gets gelu of it. Shares strides_C
+    // (both buffers are contiguous [B, M, N], host-checked).
+    public uint64_t tensor_pre;
 }
 
 public static const int TILE_N = 128;
@@ -51,6 +56,16 @@ public interface IMatmulStore<T>
 public interface IMatmulEpilogue<T>
 {
     T apply(uint batch, uint row, uint col, T acc);
+}
+
+// dual-output epilogue support (ACTIVATION == 3): store the raw result as the
+// pre-activation and hand back the gelu of its T-rounded value, computed in the
+// original dtype's arithmetic — bit-exact with the standalone activation kernel
+// the unfused pipeline would run
+public interface IPreStore<T>
+{
+    void storePre(uint batch, uint row, uint col, T value);
+    T geluPre(T value);
 }
 
 public struct StridedMatrix<T> : IMatmulLoader<T>, IMatmulStore<T>
@@ -83,7 +98,7 @@ public struct StridedMatrix<T> : IMatmulLoader<T>, IMatmulStore<T>
     }
 }
 
-public struct AccumMatrix<T : ITorchVulkan> : IMatmulLoader<T.Accum>, IMatmulStore<T.Accum>
+public struct AccumMatrix<T : ITorchVulkan> : IMatmulLoader<T.Accum>, IMatmulStore<T.Accum>, IPreStore<T.Accum>
 {
     public StridedMatrix<T> matrix;
 
@@ -101,25 +116,51 @@ public struct AccumMatrix<T : ITorchVulkan> : IMatmulLoader<T.Accum>, IMatmulSto
     {
         matrix.store(batch, row, col, T.fromAccum(value));
     }
+
+    // the dual-output gelu epilogue (ACTIVATION == 3): the pre-activation rounds
+    // to T exactly like a standalone store, and gelu runs on the rounded value
+    // in T's own arithmetic — bit-exact with the unfused pipeline's standalone
+    // activation kernel (GeluOp<T>: for half the outer arithmetic is half, erf
+    // is fp32 internally)
+    public void storePre(uint batch, uint row, uint col, T.Accum value)
+    {
+        store(batch, row, col, value);
+    }
+
+    public T.Accum geluPre(T.Accum value)
+    {
+        return T.ext_gelu(T.fromAccum(value)).toAccum();
+    }
 }
 
-public struct LinearEpilogue<T : ITorchVulkan, Act : IUnaryOp<T>, Bias : IMatmulLoader<T>> : IMatmulEpilogue<T>
+public struct LinearEpilogue<T : ITorchVulkan, Act : IUnaryOp<T>, Bias : IMatmulLoader<T>, Pre : IPreStore<T>> : IMatmulEpilogue<T>
 {
     public T alpha;
     public T beta;
     public Bias bias;
+    public Pre pre;
 
-    public __init(T alpha, T beta, Bias bias)
+    public __init(T alpha, T beta, Bias bias, Pre pre)
     {
         this.alpha = alpha;
         this.beta = beta;
         this.bias = bias;
+        this.pre = pre;
     }
 
     public T apply(uint batch, uint row, uint col, T acc)
     {
         T value = T.ext_mul(acc, alpha);
         if (HAS_BIAS == 1) value = T.ext_add(value, T.ext_mul(bias.load(batch, row, col), beta));
+        if (ACTIVATION == 3)
+        {
+            // dual-output training epilogue: materialize the pre-activation
+            // (rounded to the output dtype exactly like a standalone store) and
+            // run the activation on the rounded value — gelu_backward then sees
+            // precisely the unfused pipeline's input
+            pre.storePre(batch, row, col, value);
+            return pre.geluPre(value);
+        }
         return Act.eval(value);
     }
 }
@@ -132,6 +173,7 @@ public struct Activation<T : ITorchVulkan> : IUnaryOp<T>
         {
         case 1: return ReluOp<T>.eval(a);
         case 2: return GeluOp<T>.eval(a);
+        case 3: return GeluOp<T>.eval(a); // with the dual-output pre store above
         default: return a;
         }
     }
@@ -324,7 +366,7 @@ void matmul_simd_main<T : ITorchVulkan, let VEC : int, let TILE_M : int>(
     uniform MatmulPushConstants<T.Accum> pcs)
 {
     typealias Acc = T.Accum;
-    typealias Epilogue = LinearEpilogue<Acc, Activation<Acc>, AccumMatrix<T>>;
+    typealias Epilogue = LinearEpilogue<Acc, Activation<Acc>, AccumMatrix<T>, AccumMatrix<T>>;
 
     static groupshared Acc smemA[TILE_M * (TILE_K + 1)];
     static groupshared vector<Acc, VEC> smemB[TILE_K * (TILE_N / VEC)];
@@ -333,7 +375,8 @@ void matmul_simd_main<T : ITorchVulkan, let VEC : int, let TILE_M : int>(
     AccumMatrix<T> b = AccumMatrix<T>(pcs.tensor_b, pcs.strides_B);
     AccumMatrix<T> bias = AccumMatrix<T>(pcs.tensor_bias, pcs.strides_bias);
     AccumMatrix<T> out = AccumMatrix<T>(pcs.tensor_out, pcs.strides_C);
-    Epilogue epilogue = Epilogue(pcs.alpha, pcs.beta, bias);
+    AccumMatrix<T> pre = AccumMatrix<T>(pcs.tensor_pre, pcs.strides_C);
+    Epilogue epilogue = Epilogue(pcs.alpha, pcs.beta, bias, pre);
 
     matmulTile<Acc, VEC, TILE_M, AccumMatrix<T>, AccumMatrix<T>, Epilogue, AccumMatrix<T>>(
         li, wg, wg.z, smemA, smemB, a, b, epilogue, out, pcs.M, pcs.N, pcs.K);

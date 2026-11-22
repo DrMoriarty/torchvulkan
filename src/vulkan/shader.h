@@ -53,6 +53,10 @@ enum OpType {
 struct OpInfo {
     OpType type = OpType::COMPUTE;
 
+    // eager fusion (see api/ops/fusion.cpp): a cancelled op stays in the vector
+    // but is skipped at submit time — its work was absorbed into a fused kernel
+    bool cancelled = false;
+
     // compute
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkPipelineLayout pipelineLayout = VK_NULL_HANDLE;
@@ -107,6 +111,19 @@ public:
 
     void flush();
     void destroyAfterFlush(VulkanBuffer* buffer);
+
+    // eager fusion hooks (api/ops/fusion.cpp): producers capture the span of
+    // pending ops they recorded, consumers cancel them before a fused re-dispatch
+    struct OpSpan
+    {
+        size_t mark = 0;                     // index of the first recorded op
+        size_t count = 0;                    // ops recorded (0 = already flushed / nothing)
+        const void* first = nullptr;         // OpInfo identity of the first recorded op
+        const void* last = nullptr;          // ... and of the last one
+    };
+    OpSpan capturePendingFrom(size_t mark);
+    bool cancelPendingOps(const OpSpan& span);
+    size_t pendingOpCount();
 
 private:
     DeviceContext* device = nullptr;

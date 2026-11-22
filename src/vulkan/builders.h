@@ -7,7 +7,9 @@
 #include <string_view>
 #include <type_traits>
 
-#define MAX_PUSH_CONSTANT_BYTES 128
+// the Vulkan-guaranteed minimum is 128 bytes, but MoltenVK (and desktop drivers)
+// report far more; the runtime check compares against the device's actual limit
+#define MAX_PUSH_CONSTANT_BYTES 160
 #define MAX_SPEC_CONSTANTS 32
 #define MAX_SPEC_DATA_BYTES 256
 #define MAX_DIMS 64

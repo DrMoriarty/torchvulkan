@@ -13,6 +13,8 @@
 #include <tuple>
 #include <vector>
 #include "api/ops/helpers.h"
+#include "api/ops/internal.h"
+#include "api/ops/fusion.h"
 
 namespace {
 
@@ -277,9 +279,25 @@ at::Tensor& gelu_out_vulkan(const at::Tensor& self, c10::string_view approximate
         at::Tensor inner = at::mul(at::add(self, at::mul(x3, 0.044715)), 0.7978845608028654);
         r = at::mul(at::mul(self, 0.5), at::add(at::tanh(inner), 1));
     } else {
-        r = at::mul(at::mul(self, 0.5), at::add(at::erf(at::mul(self, 0.7071067811865476)), 1));
+        // native single-kernel erf-gelu (the fused-epilogue fallback shape)
+        r = torchvulkan::gelu_native_vulkan(self);
     }
     return fill_out(out, r);
+}
+
+at::Tensor gelu_vulkan(const at::Tensor& self, c10::string_view approximate)
+{
+    if (approximate == "none")
+    {
+        // Б1 (training_speedup.md): gelu of the last addmm's output — one fused
+        // GEMM kernel writing the pre-activation (the addmm's output, needed by
+        // gelu_backward) and the gelu result
+        at::Tensor fused = torchvulkan::consume_addmm_gelu(self);
+        if (fused.defined()) return fused;
+        return torchvulkan::gelu_native_vulkan(self);
+    }
+    at::Tensor out = at::empty_like(self);
+    return gelu_out_vulkan(self, approximate, out);
 }
 
 // torch's masked_fill_ checks; an expanded self takes the result through its distinct elements, as the CPU's kernel
@@ -1561,6 +1579,7 @@ TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("tril_indices", &tril_indices_vulkan);
     m.impl("triu_indices", &triu_indices_vulkan);
     m.impl("logit", &logit_vulkan);
+    m.impl("gelu", &gelu_vulkan);
     m.impl("gelu.out", &gelu_out_vulkan);
     m.impl("gelu_backward", &gelu_backward_vulkan);
     m.impl("silu", &silu_vulkan);

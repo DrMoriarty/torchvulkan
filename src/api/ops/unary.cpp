@@ -7,6 +7,7 @@
 #include "vulkan/allocator.h"
 #include "api/ops/helpers.h"
 #include "api/ops/internal.h"
+#include "api/ops/fusion.h"
 #include "api/fallback.h"
 
 namespace {
@@ -58,7 +59,8 @@ enum class UnaryOp {
     ERFCX = 43,
     LOG_NDTR = 44,
     I0E = 45,
-    I1E = 46
+    I1E = 46,
+    GELU = 47
 };
 
 enum class ComplexArcOp : uint32_t
@@ -232,9 +234,30 @@ torchvulkan::ComplexParts complex_sgn(const torchvulkan::ComplexParts& z)
     return {at::where(zero, at::zeros_like(z.re), q.re), at::where(zero, at::zeros_like(z.im), q.im)};
 }
 
+at::Tensor relu_impl(const at::Tensor& self, bool allow_fusion)
+{
+    // Б2 (training_speedup.md): relu of the last add's output — one fused
+    // add+relu kernel writing the pre-activation (the add's output, needed by
+    // the backward) and the relu result
+    if (allow_fusion)
+    {
+        at::Tensor fused = torchvulkan::consume_add_relu(self);
+        if (fused.defined()) return fused;
+    }
+    return unary_op_vulkan(self, UnaryOp::RELU, [](const at::Tensor& a) { return at::relu(a); });
+}
+
 at::Tensor relu_vulkan(const at::Tensor& self)
 {
-    return unary_op_vulkan(self, UnaryOp::RELU, [](const at::Tensor& a) { return at::relu(a); });
+    return relu_impl(self, /*allow_fusion=*/true);
+}
+
+// native single-kernel gelu (erf form): the registered "gelu" routes here
+// instead of the 4-5-kernel mul/erf/add/mul decomposition. The approximate
+// variants keep the decomposition (gelu.out in decompositions.cpp).
+at::Tensor gelu_native_impl(const at::Tensor& self)
+{
+    return unary_op_vulkan(self, UnaryOp::GELU, [](const at::Tensor& a) { return at::gelu(a); });
 }
 
 at::Tensor exp_vulkan(const at::Tensor& self)
@@ -511,7 +534,8 @@ at::Tensor i1e_vulkan(const at::Tensor& self)
 
 at::Tensor& relu_vulkan_(at::Tensor& self)
 {
-    return copy_inplace_result(self, relu_vulkan(self));
+    // no lookback fusion for the in-place form: the result must land in self
+    return copy_inplace_result(self, relu_impl(self, /*allow_fusion=*/false));
 }
 
 // the out= variants, which torch also routes the in-place forms (exp_, sigmoid_, ...) through
@@ -564,6 +588,15 @@ at::Tensor& i0e_out_vulkan(const at::Tensor& self, at::Tensor& out) { return fil
 at::Tensor& i1e_out_vulkan(const at::Tensor& self, at::Tensor& out) { return fill_out(out, i1e_vulkan(self)); }
 
 } // namespace
+
+namespace torchvulkan {
+
+at::Tensor gelu_native_vulkan(const at::Tensor& self)
+{
+    return gelu_native_impl(self);
+}
+
+} // namespace torchvulkan
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("relu", &relu_vulkan);

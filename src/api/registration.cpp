@@ -1,6 +1,7 @@
 #include <torch/extension.h>
 #include <ATen/autocast_mode.h>
 #include "api/ops/internal.h"
+#include "api/ops/fusion.h"
 
 TORCH_LIBRARY_IMPL(_, AutocastPrivateUse1, m) {
     m.fallback(torch::CppFunction::makeFallthrough());
@@ -18,6 +19,7 @@ TORCH_LIBRARY(torchvulkan, m) {
     m.def("rms_rope(Tensor x, Tensor cos, Tensor sin, Tensor w, float eps) -> Tensor");
     m.def("attn_decode(Tensor q, Tensor k_cache, Tensor v_cache, int cur, Tensor? k_cur=None, Tensor? v_cur=None, Tensor? qkn_w=None, Tensor? cos=None, Tensor? sin=None, float? eps=None) -> Tensor");
     m.def("silu_mul(Tensor g, Tensor u) -> Tensor");
+    m.def("add_relu(Tensor a, Tensor b, float alpha=1.0, Tensor? pre=None) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(torchvulkan, PrivateUse1, m) {
@@ -29,6 +31,7 @@ TORCH_LIBRARY_IMPL(torchvulkan, PrivateUse1, m) {
     m.impl("rms_rope", &torchvulkan::rms_rope);
     m.impl("attn_decode", &torchvulkan::attn_decode);
     m.impl("silu_mul", &torchvulkan::silu_mul_vulkan);
+    m.impl("add_relu", &torchvulkan::add_relu);
 }
 
 namespace at::autocast {

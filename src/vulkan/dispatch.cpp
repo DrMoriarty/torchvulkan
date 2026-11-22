@@ -73,6 +73,7 @@ void DAGDispatcher::dispatch(const std::vector<std::unique_ptr<OpInfo>>& operati
     for (const auto& owned : operations)
     {
         const OpInfo* op = owned.get();
+        if (op->cancelled) continue; // fused away before submit (api/ops/fusion.cpp)
         for (const MemoryRange& input : op->inputs)
         {
             // RAW: this read must wait for the previous write
@@ -117,7 +118,7 @@ void DAGDispatcher::dispatch(const std::vector<std::unique_ptr<OpInfo>>& operati
     std::vector<const OpInfo*> ready;
     for (const auto& op : operations)
     {
-        if (unresolved_deps[op.get()] == 0) ready.push_back(op.get());
+        if (!op->cancelled && unresolved_deps[op.get()] == 0) ready.push_back(op.get());
     }
 
     while (!ready.empty())

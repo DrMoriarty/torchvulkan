@@ -68,6 +68,14 @@ at::Tensor attn_decode(const at::Tensor& q, const at::Tensor& k_cache, const at:
 // ops/binary.cpp
 at::Tensor silu_mul_vulkan(const at::Tensor& g, const at::Tensor& u);
 
+// ops/unary.cpp
+at::Tensor gelu_native_vulkan(const at::Tensor& self);
+
+// ops/matmul.cpp — fused re-dispatch of a cancelled addmm with the dual-output
+// gelu epilogue (eager training fusion, see ops/fusion.cpp)
+at::Tensor addmm_gelu_fused(const at::Tensor& input, const at::Tensor& mat1, const at::Tensor& mat2,
+    const at::Scalar& beta, const at::Scalar& alpha, const at::Tensor& pre);
+
 // tensor/allocation.cpp
 void resize_bytes_vulkan(c10::StorageImpl* storage, size_t nbytes);
 const at::Tensor& resize_vulkan(const at::Tensor& self, c10::IntArrayRef size, c10::optional<at::MemoryFormat> memory_format);

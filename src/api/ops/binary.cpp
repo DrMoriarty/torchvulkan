@@ -9,6 +9,7 @@
 #include "vulkan/allocator.h"
 #include "api/ops/helpers.h"
 #include "api/ops/internal.h"
+#include "api/ops/fusion.h"
 #include <ATen/native/TypeProperties.h>
 #include <ATen/native/BinaryOps.h>
 #include <ATen/ops/_foreach_add_native.h>
@@ -16,6 +17,8 @@
 #include "api/fallback.h"
 
 namespace {
+
+using torchvulkan::FusionOpSpan;
 
 enum class BinaryOp {
     ADD = 0,
@@ -154,6 +157,15 @@ std::optional<at::Tensor> dispatch_binary_shader(
     if (!use_scalar) reads.push_back(b);
 
     uint64_t threads = contiguous ? (numel + (vecSize - 1)) / vecSize : numel;
+
+    // eager fusion (Б2, training_speedup.md): capture this add's pending op so a
+    // following relu of `out` can cancel it and run one fused add+relu kernel
+    // (api/ops/fusion.cpp) — only the plain tensor+tensor contiguous fp16/fp32
+    // path is fusable
+    bool fusable = operation == BinaryOp::ADD && !use_scalar && contiguous &&
+        (promoted_type == at::kHalf || promoted_type == at::kFloat);
+    size_t fusion_mark = fusable ? device->shader_manager->pendingOpCount() : 0;
+
     device->shader_manager->dispatchShader(
         ShaderKey{kernel, promoted_type},
         device->default_subgroup_size,
@@ -163,6 +175,12 @@ std::optional<at::Tensor> dispatch_binary_shader(
         /* write = */ {out},
         get_group_count(threads, workgroupSizeX), 1, 1
     );
+
+    if (fusable)
+    {
+        FusionOpSpan span = device->shader_manager->capturePendingFrom(fusion_mark);
+        torchvulkan::record_add_fusion(out, a, b, pushed_alpha, span);
+    }
 
     return out;
 }

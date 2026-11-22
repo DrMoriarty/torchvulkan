@@ -241,6 +241,12 @@ KERNELS = [
     Kernel('matmul_gemv', 'ops/matmul_gemv.slang', [
         Entry('matmul_gemv_main', FLOATS, ('wide_vec',)),
     ]),
+    # fused residual add + relu (training hotpath, resnet's `relu(out + shortcut)`):
+    # one kernel, two outputs — the pre-activation (relu's backward needs it) and
+    # the activated result
+    Kernel('add_relu', 'ops/add_relu.slang', [
+        Entry('add_relu_main', [F16, F32]),
+    ]),
     # weight-only quantized GEMV (M == 1): fp16/fp32 activations, int8/int4
     # weights dequantized in registers; PACK is the bits-per-weight constant
     Kernel('quant_gemv_w8', 'ops/quant_gemv.slang', [

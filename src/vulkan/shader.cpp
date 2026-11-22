@@ -90,6 +90,41 @@ void VulkanShaderManager::flush()
     submit();
 }
 
+// captures the ops recorded since `mark` (identity + count) for the fusion
+// registry; count 0 means a flush already submitted them — not fusable
+VulkanShaderManager::OpSpan VulkanShaderManager::capturePendingFrom(size_t mark)
+{
+    std::lock_guard<std::mutex> lock(record_mutex_);
+    OpSpan span;
+    span.mark = mark;
+    if (operations.size() > mark)
+    {
+        span.count = operations.size() - mark;
+        span.first = operations[mark].get();
+        span.last = operations.back().get();
+    }
+    return span;
+}
+
+// cancels the recorded span (before any submit): the ops stay in the vector but
+// the DAG skips them, their work was absorbed into the caller's fused kernel.
+// Fails (returns false) when anything else was recorded in between or the span
+// was already flushed — the consumer then falls back to separate kernels.
+bool VulkanShaderManager::cancelPendingOps(const OpSpan& span)
+{
+    std::lock_guard<std::mutex> lock(record_mutex_);
+    if (span.count == 0 || operations.size() != span.mark + span.count) return false;
+    if (operations[span.mark].get() != span.first || operations.back().get() != span.last) return false;
+    for (size_t i = span.mark; i < operations.size(); i++) operations[i]->cancelled = true;
+    return true;
+}
+
+size_t VulkanShaderManager::pendingOpCount()
+{
+    std::lock_guard<std::mutex> lock(record_mutex_);
+    return operations.size();
+}
+
 void VulkanShaderManager::destroyAfterFlush(VulkanBuffer* buffer)
 {
     std::lock_guard<std::mutex> lock(record_mutex_);
@@ -139,7 +174,8 @@ OpInfo* VulkanShaderManager::buildComputeOp(
         " workgroups, but the device allows at most ", limits.maxComputeWorkGroupCount[0], " x ", limits.maxComputeWorkGroupCount[1], " x ",
         limits.maxComputeWorkGroupCount[2], "."
     );
-    TORCH_CHECK(pushConstants.size <= MAX_PUSH_CONSTANT_BYTES, "torchvulkan [ERROR]: Push constants exceeded ", MAX_PUSH_CONSTANT_BYTES, " bytes!");
+    TORCH_CHECK(pushConstants.size <= std::min<size_t>(MAX_PUSH_CONSTANT_BYTES, device->properties.limits.maxPushConstantsSize),
+        "torchvulkan [ERROR]: Push constants exceeded ", MAX_PUSH_CONSTANT_BYTES, " bytes!");
 
     uint32_t binary = resolveBinary(key);
     ShaderSubmitInfo submit = allocateShader(binary, subgroupSize, specConstants);

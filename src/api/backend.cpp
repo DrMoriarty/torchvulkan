@@ -5,6 +5,7 @@
 #include "vulkan/allocator.h"
 #include "vulkan/generator.h"
 #include "vulkan/shader.h"
+#include "api/ops/fusion.h"
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.doc() = "torchvulkan backend";
@@ -52,6 +53,10 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("empty_cache", []() {
         for (DeviceContext* device : VulkanContext::Instance().devices) device->releaseCachedBuffers(SIZE_MAX, MemoryUsage::DEVICE_ONLY);
     }, py::call_guard<py::gil_scoped_release>());
+
+    m.def("_fusion_stats", []() -> std::tuple<uint64_t, uint64_t> {
+        return torchvulkan::fusion_stats();
+    });
 
     m.def("_save_pipeline_caches", []() {
         if (!VulkanContext::IsInitialized() || VulkanContext::IsInBadFork()) return;

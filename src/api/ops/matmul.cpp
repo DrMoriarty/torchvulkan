@@ -7,15 +7,22 @@
 #include "vulkan/allocator.h"
 #include "api/ops/helpers.h"
 #include "api/ops/internal.h"
+#include "api/ops/fusion.h"
 #include "api/fallback.h"
 
 namespace {
+
+using torchvulkan::FusionOpSpan;
 
 enum class MatmulActivation : uint32_t
 {
     NONE = 0,
     RELU = 1,
     GELU = 2,
+    // dual-output training epilogue (training_speedup.md Б1): the raw GEMM
+    // result (+bias) lands in the pre-activation buffer (the addmm output the
+    // backward's gelu_backward needs) and gelu of it in the output
+    GELU_SAVE_PRE = 3,
 };
 
 struct MatmulOperands {
@@ -86,6 +93,7 @@ at::Tensor apply_matmul_activation(
     {
         case MatmulActivation::RELU: return at::relu(out);
         case MatmulActivation::GELU: return at::gelu(out);
+        case MatmulActivation::GELU_SAVE_PRE: TORCH_CHECK(false, "torchvulkan [ERROR]: the dual-output gelu epilogue has no post-application form.");
         default: return out;
     }
 }
@@ -284,13 +292,15 @@ bool routes_to_gemv(const MatmulShape& shape, DeviceContext* device)
 }
 
 at::Tensor dispatch_matmul_simd_shader(
-    const at::Tensor& self_, 
+    const at::Tensor& self_,
     const at::Tensor& other_,
     const at::Tensor& bias_,
     const at::Scalar& alpha,
     const at::Scalar& beta,
     MatmulActivation activation,
-    std::function<at::Tensor()> cpu_fallback)
+    std::function<at::Tensor()> cpu_fallback,
+    const at::Tensor& pre = at::Tensor(),
+    FusionOpSpan* span = nullptr)
 {
     const uint32_t TILE_N = 128;
     const uint32_t TILE_K = 16;
@@ -427,6 +437,7 @@ at::Tensor dispatch_matmul_simd_shader(
             pcs.push((uint32_t)0);
             pcs.push_scalar(alpha, compute_type);
             pcs.push_scalar(0, compute_type); // beta folds in on the host
+            pcs.push((uint64_t)0); // no dual-output epilogue in the split path
 
             device->shader_manager->dispatchShader(
                 ShaderKey{kernel, result_dtype},
@@ -464,9 +475,22 @@ at::Tensor dispatch_matmul_simd_shader(
     MatmulOperands ops = prepare_matmul_operands(shape.self, shape.other, bias_, has_bias, result_dtype, M, K, N, B, shape.batch_shape);
     at::Tensor out = at::empty({B, M, N}, ops.self_b.options());
 
+    // dual-output gelu epilogue (Б1): `pre` receives the raw GEMM (+bias)
+    // result — the addmm's output tensor, which the backward's gelu_backward
+    // reads — while `out` receives gelu of it. Both are contiguous {B, M, N},
+    // so the pre matrix shares the output's strides (the push constants only
+    // carry its address).
+    bool save_pre = pre.defined();
+    TORCH_CHECK(!save_pre || activation == MatmulActivation::GELU_SAVE_PRE,
+        "torchvulkan [ERROR]: a pre-activation buffer requires the gelu epilogue.");
+    TORCH_CHECK(!save_pre || (pre.is_contiguous() && pre.numel() == out.numel() && pre.scalar_type() == result_dtype),
+        "torchvulkan [ERROR]: the matmul pre-activation buffer must be a contiguous ", result_dtype, " tensor of ", out.sizes(), ".");
+    if (save_pre) materialize_cow(pre);
+
     if (M == 0 || N == 0 || B == 0) return finish_matmul_output(out, shape);
     if (K == 0) {
         at::Tensor result = has_bias ? (ops.bias_b * beta) : out.zero_();
+        if (save_pre) pre.copy_(result.reshape(pre.sizes()));
         return finish_matmul_output(apply_matmul_activation(result, activation), shape);
     }
     if (!fits_matmul_indexing(ops, out)) {
@@ -504,6 +528,12 @@ at::Tensor dispatch_matmul_simd_shader(
     TORCH_CHECK((N + TILE_N - 1) / TILE_N <= device->properties.limits.maxComputeWorkGroupCount[0],
         "torchvulkan [ERROR]: matmul with N = ", N, " needs more column tiles than the device allows.");
 
+    // eager fusion (Б1): capture the span of ops this addmm is about to record,
+    // so the gelu consumer can cancel and re-dispatch them fused. Only a single
+    // un-batched GEMM dispatch is fusable (split-K / multi-chunk batches leave
+    // the span empty).
+    size_t fusion_mark = span ? device->shader_manager->pendingOpCount() : 0;
+
     // the batch is the grid's z dimension, so it goes in chunks of the device's limit
     const int64_t max_batch = device->properties.limits.maxComputeWorkGroupCount[2];
     for (int64_t b0 = 0; b0 < B; b0 += max_batch)
@@ -527,6 +557,7 @@ at::Tensor dispatch_matmul_simd_shader(
         pcs.push((uint32_t)0);
         pcs.push_scalar(alpha, compute_type);
         pcs.push_scalar(beta, compute_type);
+        pcs.push(save_pre ? get_output_address(pre) : (uint64_t)0);
 
         device->shader_manager->dispatchShader(
             ShaderKey{kernel, result_dtype},
@@ -534,9 +565,17 @@ at::Tensor dispatch_matmul_simd_shader(
             specialization,
             pcs.build(),
             /* read = */ readTensors,
-            /* write = */ {out},
+            /* write = */ save_pre ? std::vector<at::Tensor>{out, pre} : std::vector<at::Tensor>{out},
             (N + TILE_N - 1) / TILE_N, (M + tile_m - 1) / tile_m, static_cast<uint32_t>(batch)
         );
+    }
+
+    if (span && !save_pre)
+    {
+        FusionOpSpan captured = device->shader_manager->capturePendingFrom(fusion_mark);
+        // exactly one pending op = the plain single-GEMM dispatch; anything else
+        // (split-K folds, batch chunking, casts) stays unfused
+        if (captured.count == 1) *span = captured;
     }
 
     return finish_matmul_output(out, shape);
@@ -738,13 +777,14 @@ at::Tensor dispatch_matmul_coop_shader(
 }
 
 at::Tensor dispatch_matmul_shader(
-    const at::Tensor& self, 
+    const at::Tensor& self,
     const at::Tensor& other,
     const at::Tensor& bias,
     const at::Scalar& alpha,
     const at::Scalar& beta,
     MatmulActivation activation,
-    std::function<at::Tensor()> cpu_fallback)
+    std::function<at::Tensor()> cpu_fallback,
+    FusionOpSpan* span = nullptr)
 {
     DeviceContext* device = get_device_context(self);
 
@@ -758,7 +798,7 @@ at::Tensor dispatch_matmul_shader(
         at::Tensor out = dispatch_matmul_coop_shader(self, other, bias, alpha, beta, cpu_fallback);
         return apply_matmul_activation(out, activation);
     }
-    return dispatch_matmul_simd_shader(self, other, bias, alpha, beta, activation, cpu_fallback);
+    return dispatch_matmul_simd_shader(self, other, bias, alpha, beta, activation, cpu_fallback, at::Tensor(), span);
 }
 
 // the CPU's mm / addmm checks (mat1 is "self" in its messages)
@@ -800,20 +840,41 @@ at::Tensor bmm_vulkan(
 }
 
 at::Tensor addmm_vulkan(
-    const at::Tensor& input, 
-    const at::Tensor& mat1, 
-    const at::Tensor& mat2, 
-    const at::Scalar& beta, 
-    const at::Scalar& alpha) 
+    const at::Tensor& input,
+    const at::Tensor& mat1,
+    const at::Tensor& mat2,
+    const at::Scalar& beta,
+    const at::Scalar& alpha)
 {
     for (const at::Tensor* t : {&mat1, &mat2}) {
         TORCH_CHECK(t->device() == input.device(), "Expected all tensors to be on the same device, but found at least two devices, ", input.device(),
             " and ", t->device(), "!");
     }
     check_matrix_product("addmm", mat1, mat2);
-    return dispatch_matmul_shader(
+    FusionOpSpan span{};
+    at::Tensor result = dispatch_matmul_shader(
         mat1, mat2, input, alpha, beta, MatmulActivation::NONE,
-        [&]() { return at::addmm(input.to(at::kCPU), mat1.to(at::kCPU), mat2.to(at::kCPU), beta, alpha).to(mat1.device()); }
+        [&]() { return at::addmm(input.to(at::kCPU), mat1.to(at::kCPU), mat2.to(at::kCPU), beta, alpha).to(mat1.device()); },
+        &span
+    );
+    // eager fusion (Б1): if a following gelu consumes `result`, its single
+    // pending GEMM op is cancelled and re-dispatched with the dual-output
+    // gelu epilogue (api/ops/fusion.cpp)
+    if (span.count > 0) torchvulkan::record_addmm_fusion(result, mat1, mat2, input, alpha, beta, span);
+    return result;
+}
+
+// the fused re-dispatch of a cancelled addmm (see consume_addmm_gelu): the
+// dual-output GELU epilogue writes the raw GEMM (+bias) result into `pre` (the
+// addmm's already-returned output tensor, the input gelu_backward needs) and
+// gelu of it into the returned tensor
+at::Tensor addmm_gelu_fused_impl(const at::Tensor& input, const at::Tensor& mat1, const at::Tensor& mat2,
+    const at::Scalar& beta, const at::Scalar& alpha, const at::Tensor& pre)
+{
+    return dispatch_matmul_simd_shader(
+        mat1, mat2, input, alpha, beta, MatmulActivation::GELU_SAVE_PRE,
+        [&]() { return at::gelu(at::addmm(input.to(at::kCPU), mat1.to(at::kCPU), mat2.to(at::kCPU), beta, alpha)).to(mat1.device()); },
+        pre
     );
 }
 
@@ -912,6 +973,16 @@ at::Tensor scaled_mm_vulkan(const at::Tensor& mat1, const at::Tensor& mat2, cons
 }
 
 } // namespace
+
+namespace torchvulkan {
+
+at::Tensor addmm_gelu_fused(const at::Tensor& input, const at::Tensor& mat1, const at::Tensor& mat2,
+    const at::Scalar& beta, const at::Scalar& alpha, const at::Tensor& pre)
+{
+    return addmm_gelu_fused_impl(input, mat1, mat2, beta, alpha, pre);
+}
+
+} // namespace torchvulkan
 
 TORCH_LIBRARY_IMPL(aten, PrivateUse1, m) {
     m.impl("mm", &mm_vulkan);
