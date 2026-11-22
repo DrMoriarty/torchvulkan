@@ -348,16 +348,28 @@ at::Tensor dispatch_matmul_simd_shader(
         const char* env = std::getenv("TORCHVULKAN_MM_SPLIT_MAX");
         return env ? (uint32_t)std::atoi(env) : 256;
     }();
+    // Vulkan hides the compute unit count, so the fill estimate uses a
+    // conservative per-device guess (~40 workgroup slots on the Radeon Pro
+    // 5300M, the smallest discrete target here; larger devices merely
+    // under-split, never oversplit). Overridable for tuning.
+    static const uint32_t cu_estimate = [] {
+        const char* env = std::getenv("TORCHVULKAN_MM_SPLIT_CUS");
+        return env ? (uint32_t)std::atoi(env) : 40;
+    }();
     uint32_t grid = ((M + tile_m - 1) / tile_m) * ((N + TILE_N - 1) / TILE_N) * (uint32_t)B;
     uint32_t split = 1;
     // the fold costs ~0.1 ms per extra dispatch and the partial pass writes the
     // result once more, so splitting only pays off once the GEMM itself is large
     // enough for the grid fill to matter (below ~2 GFLOP the underfilled kernel
-    // is already fast and the overhead is a net loss)
+    // is already fast and the overhead is a net loss). The grid must also be
+    // genuinely underfilled: once it covers a wave of compute units the extra
+    // chunks buy no occupancy and the folds are a pure loss (64 tiles already
+    // saturate the 5300M — splitting that shape costs ~4-8%).
     uint64_t gemm_flops = 2ULL * M * K * N;
-    if (B == 1 && grid < target_grid && K >= 512 && gemm_flops >= 2000000000ULL) {
+    if (B == 1 && grid < cu_estimate && K >= 512 && gemm_flops >= 2000000000ULL) {
+        uint32_t fill_target = std::min(target_grid, 4 * cu_estimate);
         while (
-            split * 2 * grid <= target_grid &&
+            split * 2 * grid <= fill_target &&
             (K % (split * 2 * vecSize)) == 0 && (K / (split * 2)) >= 256
         ) {
             split *= 2;
