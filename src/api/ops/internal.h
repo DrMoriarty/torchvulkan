@@ -57,6 +57,9 @@ at::Tensor weight_int4_mm(const at::Tensor& x, const at::Tensor& w_packed, const
 at::Tensor rms_norm_fused(const at::Tensor& x, const at::Tensor& w, double eps);
 std::tuple<at::Tensor, at::Tensor> rms_norm_add(const at::Tensor& x1, const at::Tensor& x2,
     const at::Tensor& w, double eps);
+std::tuple<at::Tensor, at::Tensor> rms_norm_train_fwd(const at::Tensor& x, const at::Tensor& w, double eps);
+std::tuple<at::Tensor, at::Tensor> rms_norm_train_bwd(const at::Tensor& grad_out, const at::Tensor& x,
+    const at::Tensor& w, const at::Tensor& rrms);
 at::Tensor rope_rotate_half(const at::Tensor& x, const at::Tensor& cos_t, const at::Tensor& sin_t);
 at::Tensor rms_rope(const at::Tensor& x, const at::Tensor& cos_t, const at::Tensor& sin_t,
     const at::Tensor& w, double eps);

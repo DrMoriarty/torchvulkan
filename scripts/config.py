@@ -332,4 +332,14 @@ KERNELS = [
     Kernel('distribution', 'ops/distribution.slang', [
         Entry('distribution_main', FLOATS),
     ]),
+    # fused RMSNorm train-path (fwd + backward; experiments/lfm2_train_profile.md
+    # приоритет 1): fwd — 1 кернел (статистика fp32 + нормализация + вес +
+    # сохранённый rrms), backward — 2 кернела (grad_x + построчные члены grad_w,
+    # затем свёртка dw по строкам). 3 диспетча вместо ~18 fwd+bwd.
+    Kernel('rms_norm_train', 'ops/rms_norm.slang', [
+        Entry('rms_norm_train_main', [F16, F32]),
+    ]),
+    Kernel('rms_norm_bwd', 'ops/rms_norm_bwd.slang', [
+        Entry('rms_norm_bwd_main', [F16, F32]),
+    ]),
 ]

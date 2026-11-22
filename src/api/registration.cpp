@@ -15,6 +15,10 @@ TORCH_LIBRARY(torchvulkan, m) {
     m.def("weight_int4_mm(Tensor x, Tensor w_packed, Tensor scales, Tensor zeros, Tensor? bias=None, float? rms_eps=None, Tensor? rms_w=None, Tensor? acc=None, Tensor? x2=None) -> Tensor");
     m.def("rms_norm(Tensor x, Tensor w, float eps) -> Tensor");
     m.def("rms_norm_add(Tensor x1, Tensor x2, Tensor w, float eps) -> (Tensor, Tensor)");
+    // train-path fused RMSNorm (ops/fused.cpp): fwd saves the per-row rrms,
+    // bwd consumes it — the autograd pair lives in torchvulkan/fused_train.py
+    m.def("rms_norm_train_fwd(Tensor x, Tensor w, float eps) -> (Tensor, Tensor)");
+    m.def("rms_norm_train_bwd(Tensor grad_out, Tensor x, Tensor w, Tensor rrms) -> (Tensor, Tensor)");
     m.def("rope_rotate_half(Tensor x, Tensor cos, Tensor sin) -> Tensor");
     m.def("rms_rope(Tensor x, Tensor cos, Tensor sin, Tensor w, float eps) -> Tensor");
     m.def("attn_decode(Tensor q, Tensor k_cache, Tensor v_cache, int cur, Tensor? k_cur=None, Tensor? v_cur=None, Tensor? qkn_w=None, Tensor? cos=None, Tensor? sin=None, float? eps=None) -> Tensor");
@@ -32,6 +36,8 @@ TORCH_LIBRARY_IMPL(torchvulkan, PrivateUse1, m) {
     m.impl("weight_int4_mm", &torchvulkan::weight_int4_mm);
     m.impl("rms_norm", &torchvulkan::rms_norm_fused);
     m.impl("rms_norm_add", &torchvulkan::rms_norm_add);
+    m.impl("rms_norm_train_fwd", &torchvulkan::rms_norm_train_fwd);
+    m.impl("rms_norm_train_bwd", &torchvulkan::rms_norm_train_bwd);
     m.impl("rope_rotate_half", &torchvulkan::rope_rotate_half);
     m.impl("rms_rope", &torchvulkan::rms_rope);
     m.impl("attn_decode", &torchvulkan::attn_decode);

@@ -94,6 +94,145 @@ at::Tensor rms_norm_fused(const at::Tensor& x, const at::Tensor& w, double eps)
     return out;
 }
 
+// Train-path fused RMSNorm forward: out = w * round_T(x32*rrms), rrms saved
+// (fp32, (rows,)) for rms_norm_train_bwd. Rounding pattern replicates the
+// transformers decomposition (Lfm2RMSNorm) so train equivalence holds against
+// eager autograd; see rms_norm.slang (rms_norm_train_main).
+std::tuple<at::Tensor, at::Tensor> rms_norm_train_fwd(const at::Tensor& x, const at::Tensor& w, double eps)
+{
+    check_fused_dtype(x, "x");
+    check_fused_dtype(w, "w");
+    TORCH_CHECK(w.scalar_type() == x.scalar_type(), "torchvulkan [ERROR]: rms_norm_train weight dtype (",
+        w.scalar_type(), ") must match the input dtype (", x.scalar_type(), ").");
+    TORCH_CHECK(w.dim() == 1, "torchvulkan [ERROR]: rms_norm_train weight must be 1D, got ", w.sizes(), ".");
+    const int64_t hidden = x.size(-1);
+    TORCH_CHECK(hidden >= 1, "torchvulkan [ERROR]: rms_norm_train needs a non-empty last dimension.");
+    TORCH_CHECK(w.numel() == hidden, "torchvulkan [ERROR]: rms_norm_train weight (", w.sizes(),
+        ") must match the last dimension (", hidden, ").");
+
+    at::Tensor xc = x.contiguous();
+    at::Tensor wc = w.contiguous();
+    const int64_t rows = xc.numel() / hidden;
+    at::Tensor out = at::empty_like(xc);
+    at::Tensor rrms = at::empty({rows}, xc.options().dtype(at::kFloat));
+    if (rows == 0) return {out, rrms};
+
+    DeviceContext* device = get_device_context(xc);
+    const uint32_t lanes = device->default_subgroup_size;
+    const uint32_t wg = (RMS_WG % lanes == 0) ? RMS_WG : lanes;
+    const uint32_t waves = wg / lanes; // rows per workgroup
+    TORCH_CHECK(waves >= 1 && (rows + waves - 1) / waves <= device->properties.limits.maxComputeWorkGroupCount[0],
+        "torchvulkan [ERROR]: rms_norm_train row count ", rows, " exceeds the device workgroup limit.");
+
+    materialize_cow(xc);
+    materialize_cow(wc);
+
+    SpecializationBuilder spd{};
+    spd.push(wg);
+    SpecializationArgs specialization = spd.build();
+
+    PushConstantBuilder pcs{};
+    pcs.push(get_tensor_address(xc));
+    pcs.push(get_tensor_address(wc));
+    pcs.push(get_output_address(rrms));
+    pcs.push(get_output_address(out));
+    pcs.push(static_cast<uint32_t>(rows));
+    pcs.push(static_cast<uint32_t>(hidden));
+    pcs.push(static_cast<float>(eps));
+
+    device->shader_manager->dispatchShader(
+        ShaderKey{torchvulkan::Kernel::RMS_NORM_TRAIN, xc.scalar_type()},
+        device->default_subgroup_size,
+        specialization,
+        pcs.build(),
+        /* read = */ {xc, wc},
+        /* write = */ {rrms, out},
+        (static_cast<uint32_t>(rows) + waves - 1) / waves, 1, 1
+    );
+
+    return {out, rrms};
+}
+
+// Train-path fused RMSNorm backward: (grad_x, grad_w) for the forward above,
+// one custom kernel (rms_norm_bwd.slang) — grad_x and the per-row weight-grad
+// terms dwc, one workgroup of 128 threads per row — plus the ordinary aten
+// sum of dwc over the rows for grad_w: the very reduction the eager graph
+// runs on the same term tensor, so grad_w matches eager bit-exact (and picks
+// up the reduce kernel's split/tree for long row counts). Together with the
+// forward: 3-4 dispatches per fwd+bwd instead of ~18.
+std::tuple<at::Tensor, at::Tensor> rms_norm_train_bwd(const at::Tensor& grad_out, const at::Tensor& x,
+    const at::Tensor& w, const at::Tensor& rrms)
+{
+    check_fused_dtype(grad_out, "grad_out");
+    check_fused_dtype(x, "x");
+    check_fused_dtype(w, "w");
+    TORCH_CHECK(grad_out.scalar_type() == x.scalar_type() && w.scalar_type() == x.scalar_type(),
+        "torchvulkan [ERROR]: rms_norm_train_bwd dtype mismatch: grad_out (", grad_out.scalar_type(),
+        "), x (", x.scalar_type(), "), w (", w.scalar_type(), ").");
+    TORCH_CHECK(rrms.is_privateuseone() && rrms.scalar_type() == at::kFloat,
+        "torchvulkan [ERROR]: rms_norm_train_bwd rrms must be a vulkan fp32 tensor, got ",
+        rrms.device(), " ", rrms.scalar_type(), ".");
+    TORCH_CHECK(grad_out.sizes() == x.sizes(),
+        "torchvulkan [ERROR]: rms_norm_train_bwd grad_out (", grad_out.sizes(), ") must match x (", x.sizes(), ").");
+    const int64_t hidden = x.size(-1);
+    TORCH_CHECK(hidden >= 1, "torchvulkan [ERROR]: rms_norm_train_bwd needs a non-empty last dimension.");
+    TORCH_CHECK(w.numel() == hidden, "torchvulkan [ERROR]: rms_norm_train_bwd weight (", w.sizes(),
+        ") must match the last dimension (", hidden, ").");
+
+    at::Tensor gc = grad_out.contiguous();
+    at::Tensor xc = x.contiguous();
+    at::Tensor wc = w.contiguous();
+    at::Tensor rc = rrms.contiguous();
+    const int64_t rows = xc.numel() / hidden;
+    at::Tensor dx = at::empty_like(xc);
+    at::Tensor dw = at::empty_like(wc);
+    if (rows == 0) return {dx, dw};
+    TORCH_CHECK(rc.numel() == rows, "torchvulkan [ERROR]: rms_norm_train_bwd rrms (", rc.sizes(),
+        ") must have one entry per row (", rows, ").");
+
+    DeviceContext* device = get_device_context(xc);
+    TORCH_CHECK(rows <= (int64_t)device->properties.limits.maxComputeWorkGroupCount[0],
+        "torchvulkan [ERROR]: rms_norm_train_bwd row count ", rows, " exceeds the workgroup count limit.");
+
+    materialize_cow(gc);
+    materialize_cow(xc);
+    materialize_cow(wc);
+    materialize_cow(rc);
+
+    // kernel: grad_x + построчные члены grad_w, один WG (128) на строку
+    at::Tensor dwc = at::empty_like(xc);
+    {
+        SpecializationBuilder spd{}; // WG = 128 задан compile-time в шейдере
+        SpecializationArgs specialization = spd.build();
+
+        PushConstantBuilder pcs{};
+        pcs.push(get_tensor_address(gc));
+        pcs.push(get_tensor_address(xc));
+        pcs.push(get_tensor_address(wc));
+        pcs.push(get_tensor_address(rc));
+        pcs.push(get_output_address(dwc));
+        pcs.push(get_output_address(dx));
+        pcs.push(static_cast<uint32_t>(rows));
+        pcs.push(static_cast<uint32_t>(hidden));
+
+        device->shader_manager->dispatchShader(
+            ShaderKey{torchvulkan::Kernel::RMS_NORM_BWD, xc.scalar_type()},
+            device->default_subgroup_size,
+            specialization,
+            pcs.build(),
+            /* read = */ {gc, xc, wc, rc},
+            /* write = */ {dwc, dx},
+            static_cast<uint32_t>(rows), 1, 1
+        );
+    }
+
+    // grad_w: та же aten-редукция по строкам, что в eager-графе (байт-в-байт);
+    // reduce-кернел сам выбирает split/tree для длинного rows
+    dw = dwc.reshape({rows, hidden}).sum(0);
+
+    return {dx, dw};
+}
+
 // Fused residual-add + RMSNorm with two outputs (decode hotpath): one kernel
 // instead of aten add + rms_norm (two dispatches per decoder layer).
 //   sum = x1 + x2                                  (residual carried forward)
