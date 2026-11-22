@@ -18,6 +18,8 @@ _rms_fwd_op = torch.ops.torchvulkan.rms_norm_train_fwd
 _rms_bwd_op = torch.ops.torchvulkan.rms_norm_train_bwd
 _ce_fwd_op = torch.ops.torchvulkan.ce_fwd
 _ce_bwd_op = torch.ops.torchvulkan.ce_bwd
+_rope_fwd_op = torch.ops.torchvulkan.rope_train_fwd
+_rope_bwd_op = torch.ops.torchvulkan.rope_train_bwd
 
 
 class _FusedRMSNorm(torch.autograd.Function):
@@ -157,3 +159,90 @@ def fused_cross_entropy(h: torch.Tensor, weight: torch.Tensor, target: torch.Ten
     logits: peak CE memory is one [N, V] buffer in the dtype of h.
     """
     return _FusedCrossEntropy.apply(h, weight, target, ignore_index, reduction)
+
+
+class _FusedRotaryPosEmb(torch.autograd.Function):
+    """Fused train-path rotate-half RoPE over q and k (2 dispatches per
+    fwd+bwd instead of the ~14-17-kernel eager chain of apply_rotary_pos_emb).
+
+    rotate-half is a signed permutation P (skew-symmetric, P^T = -P), so the
+    composite is linear: y = x*cos + P(x)*sin, grad_x = g*cos - P(g)*sin — the
+    backward kernel is the forward one with the sin term's sign flipped. Only
+    the (small) cos/sin tables are saved for backward; grad wrt cos/sin is not
+    produced (they come from the no-grad rotary-embedding buffers upstream).
+    """
+
+    @staticmethod
+    def forward(ctx, q, k, cos, sin):
+        q_embed, k_embed = _rope_fwd_op(q, k, cos, sin)
+        ctx.save_for_backward(cos, sin)
+        return q_embed, k_embed
+
+    @staticmethod
+    def backward(ctx, grad_q, grad_k):
+        cos, sin = ctx.saved_tensors
+        dq, dk = _rope_bwd_op(grad_q, grad_k, cos, sin)
+        return dq, dk, None, None
+
+
+def rope_train(q: torch.Tensor, k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor):
+    """Fused train-path rotate-half RoPE: (q_embed, k_embed) = rope(q, k, cos, sin).
+
+    q: (B, n_q, T, hd), k: (B, n_kv, T, hd) fp16/fp32 vulkan tensors (GQA
+    supported — head counts may differ); cos/sin: (B, T, hd) rows of the
+    precomputed full-size tables, same dtype. Rounding pattern replicates the
+    eager apply_rotary_pos_emb chain (two rounded muls, one rounded add), so
+    forward and gradients match eager autograd at fp16-rounding level.
+    """
+    return _FusedRotaryPosEmb.apply(q, k, cos, sin)
+
+
+_ROTARY_MODULE_NAMES = ("transformers.models.lfm2.modeling_lfm2",)
+_PATCH_ATTR = "_torchvulkan_fused_rope_orig"
+
+
+def patch_apply_rotary_pos_emb(module_names=_ROTARY_MODULE_NAMES) -> int:
+    """Route apply_rotary_pos_emb of the given transformers model modules
+    through the fused train kernel when the inputs fit (vulkan 4D fp16/fp32
+    q/k with (B, T, hd) tables of the same dtype); everything else — decode
+    shapes, CPU tensors, exotic dtypes — falls back to the original function.
+
+    Returns the number of patched modules. Idempotent.
+    """
+    import importlib
+
+    patched = 0
+    for name in module_names:
+        mod = importlib.import_module(name)
+        fn = getattr(mod, "apply_rotary_pos_emb", None)
+        if fn is None or hasattr(fn, _PATCH_ATTR):
+            continue
+
+        def make_patched(orig):
+            def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
+                if (unsqueeze_dim == 1 and q.dim() == 4 and k.dim() == 4 and cos.dim() == 3
+                        and q.device.type == "vulkan" and q.dtype == k.dtype == cos.dtype == sin.dtype
+                        and q.dtype in (torch.float16, torch.float32)):
+                    return _FusedRotaryPosEmb.apply(q, k, cos, sin)
+                return orig(q, k, cos, sin, unsqueeze_dim)
+
+            setattr(apply_rotary_pos_emb, _PATCH_ATTR, orig)
+            return apply_rotary_pos_emb
+
+        mod.apply_rotary_pos_emb = make_patched(fn)
+        patched += 1
+    return patched
+
+
+def unpatch_apply_rotary_pos_emb(module_names=_ROTARY_MODULE_NAMES) -> int:
+    """Restore the original apply_rotary_pos_emb (inverse of the patcher)."""
+    import importlib
+
+    restored = 0
+    for name in module_names:
+        mod = importlib.import_module(name)
+        fn = getattr(mod, "apply_rotary_pos_emb", None)
+        if fn is not None and hasattr(fn, _PATCH_ATTR):
+            mod.apply_rotary_pos_emb = getattr(fn, _PATCH_ATTR)
+            restored += 1
+    return restored

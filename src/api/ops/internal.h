@@ -61,6 +61,12 @@ std::tuple<at::Tensor, at::Tensor> rms_norm_train_fwd(const at::Tensor& x, const
 std::tuple<at::Tensor, at::Tensor> rms_norm_train_bwd(const at::Tensor& grad_out, const at::Tensor& x,
     const at::Tensor& w, const at::Tensor& rrms);
 at::Tensor rope_rotate_half(const at::Tensor& x, const at::Tensor& cos_t, const at::Tensor& sin_t);
+// ops/fused.cpp — fused train-path rotate-half RoPE (q и k одним диспатчем);
+// autograd-пара lives in torchvulkan/fused_train.py
+std::tuple<at::Tensor, at::Tensor> rope_train_fwd(const at::Tensor& q, const at::Tensor& k,
+    const at::Tensor& cos_t, const at::Tensor& sin_t);
+std::tuple<at::Tensor, at::Tensor> rope_train_bwd(const at::Tensor& grad_q, const at::Tensor& grad_k,
+    const at::Tensor& cos_t, const at::Tensor& sin_t);
 at::Tensor rms_rope(const at::Tensor& x, const at::Tensor& cos_t, const at::Tensor& sin_t,
     const at::Tensor& w, double eps);
 at::Tensor attn_decode(const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache, int64_t cur,

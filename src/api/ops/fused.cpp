@@ -355,6 +355,143 @@ at::Tensor rope_rotate_half(const at::Tensor& x, const at::Tensor& cos_t, const 
     return out;
 }
 
+namespace {
+
+// Shared shape/stride plumbing of rope_train_fwd / rope_train_bwd: q
+// (B, n_q, T, hd), k (B, n_kv, T, hd) — the attention transposes (1, 2), so
+// the last-dim stride is the only one required to be 1 (a non-unit one costs
+// one contiguous() copy); cos/sin (B, T, hd) contiguous tables. Returns the
+// (possibly copied) tensors and the pushed-shape fields.
+struct RopeTrainPlan
+{
+    at::Tensor a, b, cc, sc;
+    int64_t hd, seq, n_q, n_kv, rows_q, rows_k;
+};
+
+RopeTrainPlan plan_rope_train(const at::Tensor& a, const at::Tensor& b,
+    const at::Tensor& cos_t, const at::Tensor& sin_t)
+{
+    check_fused_dtype(a, "q");
+    check_fused_dtype(b, "k");
+    check_fused_dtype(cos_t, "cos");
+    check_fused_dtype(sin_t, "sin");
+    TORCH_CHECK(a.scalar_type() == b.scalar_type() && cos_t.scalar_type() == a.scalar_type()
+            && sin_t.scalar_type() == a.scalar_type(),
+        "torchvulkan [ERROR]: rope_train dtype mismatch: q (", a.scalar_type(), "), k (",
+        b.scalar_type(), "), cos (", cos_t.scalar_type(), "), sin (", sin_t.scalar_type(), ").");
+    TORCH_CHECK(a.dim() == 4 && b.dim() == 4,
+        "torchvulkan [ERROR]: rope_train expects 4D q/k (B, heads, T, hd), got ",
+        a.sizes(), " and ", b.sizes(), ".");
+    const int64_t hd = a.size(3), seq = a.size(2);
+    TORCH_CHECK(hd >= 2 && hd % 2 == 0,
+        "torchvulkan [ERROR]: rope_train needs an even head_dim, got ", hd, ".");
+    TORCH_CHECK(b.size(0) == a.size(0) && b.size(2) == seq && b.size(3) == hd,
+        "torchvulkan [ERROR]: rope_train k shape ", b.sizes(), " does not match q ", a.sizes(),
+        " (batch, seq, head_dim must be equal).");
+    TORCH_CHECK(cos_t.dim() == 3 && sin_t.dim() == 3
+            && (cos_t.size(0) == a.size(0) || cos_t.size(0) == 1)
+            && cos_t.size(1) == seq && cos_t.size(2) == hd
+            && sin_t.sizes() == cos_t.sizes(),
+        "torchvulkan [ERROR]: rope_train expects cos/sin (B, T, hd) = (", a.size(0), ", ", seq,
+        ", ", hd, ") or (1, T, hd) broadcast, got ", cos_t.sizes(), " and ", sin_t.sizes(), ".");
+
+    RopeTrainPlan p;
+    p.hd = hd;
+    p.seq = seq;
+    p.n_q = a.size(1);
+    p.n_kv = b.size(1);
+    p.rows_q = a.size(0) * p.n_q * seq;
+    p.rows_k = b.size(0) * p.n_kv * seq;
+    p.a = a.stride(3) == 1 ? a : a.contiguous();
+    p.b = b.stride(3) == 1 ? b : b.contiguous();
+    p.cc = cos_t.contiguous();
+    p.sc = sin_t.contiguous();
+    return p;
+}
+
+std::tuple<at::Tensor, at::Tensor> rope_train_dispatch(const at::Tensor& a, const at::Tensor& b,
+    const at::Tensor& cos_t, const at::Tensor& sin_t, bool backward)
+{
+    RopeTrainPlan p = plan_rope_train(a, b, cos_t, sin_t);
+    // contiguous outputs: the kernel addresses them linearly over (rows, hd)
+    at::Tensor oa = at::empty(p.a.sizes(), p.a.options());
+    at::Tensor ob = at::empty(p.b.sizes(), p.b.options());
+    const int64_t total = (p.rows_q + p.rows_k) * p.hd;
+    if (total == 0) return {oa, ob};
+
+    DeviceContext* device = get_device_context(p.a);
+    TORCH_CHECK((total + ROPE_WG - 1) / ROPE_WG <= device->properties.limits.maxComputeWorkGroupCount[0],
+        "torchvulkan [ERROR]: rope_train element count ", total, " exceeds the workgroup count limit.");
+
+    materialize_cow(p.a);
+    materialize_cow(p.b);
+    materialize_cow(p.cc);
+    materialize_cow(p.sc);
+
+    SpecializationBuilder spd{};
+    spd.push(ROPE_WG);
+    SpecializationArgs specialization = spd.build();
+
+    // порядок пушей = порядку полей RopeTrainPushConstants (см. шейдер)
+    PushConstantBuilder pcs{};
+    pcs.push(get_tensor_address(p.a));
+    pcs.push(get_tensor_address(p.b));
+    pcs.push(get_tensor_address(p.cc));
+    pcs.push(get_tensor_address(p.sc));
+    pcs.push(get_output_address(oa));
+    pcs.push(get_output_address(ob));
+    pcs.push(static_cast<uint32_t>(p.hd));
+    pcs.push(static_cast<uint32_t>(p.seq));
+    pcs.push(static_cast<uint32_t>(p.n_q));
+    pcs.push(static_cast<uint32_t>(p.n_kv));
+    pcs.push(static_cast<uint32_t>(p.rows_q));
+    pcs.push(static_cast<uint32_t>(p.rows_k));
+    pcs.push(static_cast<uint32_t>(p.a.stride(0)));
+    pcs.push(static_cast<uint32_t>(p.a.stride(1)));
+    pcs.push(static_cast<uint32_t>(p.a.stride(2)));
+    pcs.push(static_cast<uint32_t>(p.b.stride(0)));
+    pcs.push(static_cast<uint32_t>(p.b.stride(1)));
+    pcs.push(static_cast<uint32_t>(p.b.stride(2)));
+    // (1, T, hd) таблицы бродкастятся по батчу
+    pcs.push(static_cast<uint32_t>(p.cc.size(0) == 1 ? 0 : p.seq));
+
+    device->shader_manager->dispatchShader(
+        ShaderKey{backward ? torchvulkan::Kernel::ROPE_TRAIN_BWD : torchvulkan::Kernel::ROPE_TRAIN_FWD,
+            p.a.scalar_type()},
+        device->default_subgroup_size,
+        specialization,
+        pcs.build(),
+        /* read = */ {p.a, p.b, p.cc, p.sc},
+        /* write = */ {oa, ob},
+        (static_cast<uint32_t>(total) + ROPE_WG - 1) / ROPE_WG, 1, 1
+    );
+
+    return {oa, ob};
+}
+
+} // namespace
+
+// Fused train-path rotate-half RoPE, forward: ONE dispatch for both q and k
+// (B, n_heads, T, hd) instead of the ~7-kernel eager chain per tensor.
+// cos/sin: (B, T, hd) rows of the precomputed tables. Rounding pattern
+// replicates the eager fp16 chain (two rounded muls, one rounded add), see
+// rope_train.slang. grad wrt cos/sin is not produced (inv_freq buffers,
+// requires_grad=False upstream).
+std::tuple<at::Tensor, at::Tensor> rope_train_fwd(const at::Tensor& q, const at::Tensor& k,
+    const at::Tensor& cos_t, const at::Tensor& sin_t)
+{
+    return rope_train_dispatch(q, k, cos_t, sin_t, /*backward=*/false);
+}
+
+// Backward of rope_train_fwd: rotate-half is a skew-symmetric signed
+// permutation (P^T = -P), so grad_x = g*cos - P(g)*sin — the same kernel with
+// the sin term's sign flipped, still one dispatch for both tensors.
+std::tuple<at::Tensor, at::Tensor> rope_train_bwd(const at::Tensor& grad_q, const at::Tensor& grad_k,
+    const at::Tensor& cos_t, const at::Tensor& sin_t)
+{
+    return rope_train_dispatch(grad_q, grad_k, cos_t, sin_t, /*backward=*/true);
+}
+
 // Fused per-row RMSNorm + rotate-half RoPE (decode QK stage): replaces the
 // rms_norm -> rope_rotate_half pair with one kernel. x: (rows, hd) contiguous;
 // w: (rows, hd) per-row QK-norm weights (attention scale pre-folded into the

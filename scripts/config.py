@@ -362,4 +362,15 @@ KERNELS = [
     Kernel('ce_grad', 'ops/cross_entropy.slang', [
         Entry('ce_grad_main', [F16, F32], (), constants=(256,)),
     ]),
+    # fused train-path rotate-half RoPE (experiments/lfm2_train_profile.md
+    # приоритет 3): fwd — 1 кернел (q и k одним диспатчем), backward — 1 кернел
+    # (rotate-half — знаковая перестановка, grad_x = g*cos - P(g)*sin);
+    # 2 диспетча на fwd+bwd вместо ~14-17. Автоград-пара и патчер
+    # apply_rotary_pos_emb — torchvulkan/fused_train.py
+    Kernel('rope_train_fwd', 'ops/rope_train.slang', [
+        Entry('rope_train_fwd_main', [F16, F32]),
+    ]),
+    Kernel('rope_train_bwd', 'ops/rope_train.slang', [
+        Entry('rope_train_bwd_main', [F16, F32]),
+    ]),
 ]

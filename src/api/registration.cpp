@@ -25,6 +25,10 @@ TORCH_LIBRARY(torchvulkan, m) {
     m.def("ce_fwd(Tensor h, Tensor weight, Tensor target, int ignore_index=-100) -> (Tensor, Tensor, Tensor, Tensor)");
     m.def("ce_bwd(Tensor grad_rows, Tensor logits, Tensor max, Tensor log_s, Tensor target, Tensor h, Tensor weight, int ignore_index=-100) -> (Tensor, Tensor)");
     m.def("rope_rotate_half(Tensor x, Tensor cos, Tensor sin) -> Tensor");
+    // train-path fused rotate-half RoPE (ops/fused.cpp): fwd и bwd — по одному
+    // кернелу на q+k; autograd-пара lives in torchvulkan/fused_train.py
+    m.def("rope_train_fwd(Tensor q, Tensor k, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
+    m.def("rope_train_bwd(Tensor grad_q, Tensor grad_k, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
     m.def("rms_rope(Tensor x, Tensor cos, Tensor sin, Tensor w, float eps) -> Tensor");
     m.def("attn_decode(Tensor q, Tensor k_cache, Tensor v_cache, int cur, Tensor? k_cur=None, Tensor? v_cur=None, Tensor? qkn_w=None, Tensor? cos=None, Tensor? sin=None, float? eps=None) -> Tensor");
     m.def("silu_mul(Tensor g, Tensor u) -> Tensor");
@@ -46,6 +50,8 @@ TORCH_LIBRARY_IMPL(torchvulkan, PrivateUse1, m) {
     m.impl("ce_fwd", &torchvulkan::ce_fwd);
     m.impl("ce_bwd", &torchvulkan::ce_bwd);
     m.impl("rope_rotate_half", &torchvulkan::rope_rotate_half);
+    m.impl("rope_train_fwd", &torchvulkan::rope_train_fwd);
+    m.impl("rope_train_bwd", &torchvulkan::rope_train_bwd);
     m.impl("rms_rope", &torchvulkan::rms_rope);
     m.impl("attn_decode", &torchvulkan::attn_decode);
     m.impl("silu_mul", &torchvulkan::silu_mul_vulkan);
