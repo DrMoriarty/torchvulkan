@@ -529,6 +529,11 @@ class TestVulkanOps(TestCase):
     @classmethod
     def tearDownClass(cls):
         super().tearDownClass()
+        # under pytest-xdist (default parallel run, see tox.ini) this summary would be
+        # per-worker — each process only saw a slice of the OpInfo table — and worker
+        # stdout is captured anyway; keep it for serial runs only.
+        if os.environ.get("PYTEST_XDIST_WORKER") is not None:
+            return
         print(f'\n--- TEST SUMMARY ---')
         print(f'The complete set of working operators is: {REMAINING_OPS}')
         sorted_ops = sorted(UNIMPLEMENTED_OPS.items(), key=lambda item: item[1], reverse=True)
