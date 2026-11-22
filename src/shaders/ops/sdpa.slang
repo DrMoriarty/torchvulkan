@@ -6,19 +6,17 @@ module sdpa;
 // same ops bwd. Three kernels:
 //
 //   sdpa_fwd_main   QK^T (causal) + softmax + P*V in one kernel, one
-//                   workgroup of WG threads per q row (b, h, i). Two passes,
-//                   no score row in groupshared memory: pass 1 streams the
-//                   thread's scores (j = ti, ti+WG, ...) keeping only the
-//                   running max and denominator in registers (online rescale),
-//                   pass 2 recomputes the same scores (K is L1/L2-hot), writes
-//                   the normalized prob row and accumulates out[dim = ti]
-//                   against a WG-wide chunk of weights exchanged through a
-//                   128-float groupshared scratch. The old single-pass design
-//                   kept the whole score row (up to 4096 floats = 16 KB) in
-//                   groupshared memory, which capped occupancy at ~3 WG/CU on
-//                   the 64 KB LDS of the 5300M and made the kernel
-//                   latency-bound (~0.44 us per row); with the 512-byte
-//                   scratch the same shape runs several times faster.
+//                   workgroup of WG threads per R q-rows (b, h, row-tile).
+//                   Two passes, no score row in groupshared memory: pass 1
+//                   streams the thread's scores (j = ti, ti+WG, ...) keeping
+//                   only the running max and denominator in registers (online
+//                   rescale), pass 2 recomputes the same scores (K is L1/L2-
+//                   hot), writes the normalized prob row and accumulates
+//                   out[dim = ti] against a WG-wide chunk of weights
+//                   exchanged through a small groupshared scratch. The main
+//                   range of pass 2 is unrolled x4 (four independent V loads
+//                   in flight) — the serial load->FMA chain was the dominant
+//                   cost on MoltenVK (~0.35 us per R-row tile -> ~0.14).
 //                   Outputs: out (B, Hq, L, hd) and probs P (B, Hkv, qpg, L, S)
 //                   fp16/fp32 — P is what the backward kernels consume
 //                   (dS = P*(dP - delta), dV = P^T @ dO), so no logsumexp
@@ -26,15 +24,17 @@ module sdpa;
 //   sdpa_rowdot_main  delta[r] = sum_d dO[r, d] * out[r, d] (one thread per row)
 //   sdpa_ds_main      dS = P * (dP - delta[row]) with the causal entries zeroed
 //
+// The backward's four GEMMs (dP = dO @ V^T, dQ = dS @ K, dK = dS^T @ Q,
+// dV = P^T @ dO) stay on the regular matmul kernels: hand-rolled fused
+// backward kernels (FA2-style, per-thread rows/columns) were tried and lost
+// to the GEMMs on the 5300M at these shapes — the GEMM kernels win on
+// occupancy and load scheduling even for skinny (128, 64) batches.
+//
 // Semantics match the math path: the mask is j <= i (at::ones(L,S).tril(),
 // top-left aligned, also for L != S), the effective scale folded into the
 // scores is calculate_scale (1/sqrt(head_dim) or the user's value). GQA maps
 // q head h to kv group g = h / qpg — the same per-head math the math path's
 // repeat_interleave expansion produces. All accumulation fp32.
-//
-// Backward GEMMs (dP = dO @ V^T, dQ = dS @ K, dK = dS^T @ Q, dV = P^T @ dO)
-// stay on the regular matmul kernels: with the grouped views
-// (B, Hkv, qpg*L, {S | hd}) all four are B*Hkv-batched and need no expansion.
 
 __exported import core.dtype;
 import core.indexing;
@@ -60,261 +60,316 @@ public struct SdpaFwdPushConstants
     public uint s_dim;            // S (<= SMEM_L_CAP)
     public uint hd;               // (<= HD_CAP)
     public uint rows_x;           // row-groups per y slice (grid y-split)
+    public uint tph;              // tiles per head: ceil(L / R)
     public float scale;           // effective multiplier on q.k^T
 }
 
-groupshared float smem_red[128];   // lane reduction scratch (max / den / weights)
+// lane reduction scratch (max / den / weights), R строк тайла рядами:
+// smem_red[r * WG + t]; R-цепочки сканов чередуются, чтобы латентность
+// скана не росла с числом строк. Размер под R=8 (максимум инстансов).
+groupshared float smem_red[8 * 128];
 
 [shader("compute")]
 [numthreads(128, 1, 1)]
-void sdpa_fwd_main<T : ITorchVulkan, let WG : int>(
+void sdpa_fwd_main<T : ITorchVulkan, let WG : int, let R : int>(
     uint ti : SV_GroupIndex,
     uint3 wg : SV_GroupID,
     uniform SdpaFwdPushConstants pcs)
 {
-    uint row = wg.y * pcs.rows_x + wg.x;
-    if (row >= pcs.rows) return;
-
-    uint bl = pcs.hq * pcs.l_dim;
-    uint b_idx = row / bl;
-    uint rem = row - b_idx * bl;
-    uint h = rem / pcs.l_dim;
-    uint i = rem - h * pcs.l_dim;
+    // один WG обрабатывает R подряд идущих q-строк одного (b, h): K/V и
+    // групповые сканы/барьеры амортизируются на R строк, V в phase B
+    // читается один раз на все R строк
+    uint tile = wg.y * pcs.rows_x + wg.x;
+    uint head = tile / pcs.tph;
+    uint i0 = (tile - head * pcs.tph) * R;
+    if (i0 >= pcs.l_dim) return;
+    uint b_idx = head / pcs.hq;
+    uint h = head - b_idx * pcs.hq;
     uint g = h / pcs.qpg;
-    uint jmax = min(i + 1, pcs.s_dim); // causal: j <= i (and j < S)
 
-    T* K = (T*)pcs.tensor_k + uint64_t(b_idx * pcs.hkv + g) * pcs.s_dim * pcs.hd;
-    T* V = (T*)pcs.tensor_v + uint64_t(b_idx * pcs.hkv + g) * pcs.s_dim * pcs.hd;
-    T* prob_row = (T*)pcs.tensor_probs
-        + uint64_t((b_idx * pcs.hkv + g) * pcs.qpg + (h - g * pcs.qpg)) * pcs.l_dim * pcs.s_dim
-        + uint64_t(i) * pcs.s_dim;
+    T* K = (T*)pcs.tensor_k + (b_idx * pcs.hkv + g) * pcs.s_dim * pcs.hd;
+    T* V = (T*)pcs.tensor_v + (b_idx * pcs.hkv + g) * pcs.s_dim * pcs.hd;
+    T* prob_base = (T*)pcs.tensor_probs
+        + ((b_idx * pcs.hkv + g) * pcs.qpg + (h - g * pcs.qpg)) * pcs.l_dim * pcs.s_dim;
 
-    // q адрес строки: значения читаются из L1 прямо в FMA-цепочках (все
-    // потоки WG читают один адрес — broadcast), q НЕ держится в регистрах:
-    // массив hd float на поток резал occupancy по VGPR сильнее, чем
-    // groupshared скоры по LDS
     bool vec = (sizeof(T) == 2) && (pcs.hd % 8 == 0);
     uint wcnt = vec ? pcs.hd / 8 : 0;
-    uint4* q4 = (uint4*)pcs.tensor_q;
-    uint qbase4 = row * wcnt;
+    uint4* k4 = (uint4*)pcs.tensor_k;
+    uint kbase4 = (b_idx * pcs.hkv + g) * pcs.s_dim * wcnt;
 
-    // pass 1: stream the thread's scores (j = ti, ti+WG, ...), keeping only
-    // the running max and denominator in registers — no score row in
-    // groupshared memory, so the WG scratch stays at 128 floats
-    float m_lane = -3.4e38;
-    float den_lane = 0.0;
-    for (uint j = ti; j < jmax; j += WG)
+    // q-строки не живут в регистрах (массив hd float на строку резал
+    // occupancy по VGPR сильнее groupshared скоров по LDS) — читаются из L1
+    uint4* q4 = (uint4*)pcs.tensor_q;
+    uint qbase4 = head * pcs.l_dim * wcnt + i0 * wcnt; // строка r: + r * wcnt
+
+    // строка r активна, пока i0 + r < l_dim; её каузальная граница jmax_r
+    float m_lane[R];
+    float den_lane[R];
+    uint jmax_hi = min(i0 + R, pcs.s_dim); // верхняя граница j по всем строкам
+    [ForceUnroll]
+    for (uint r = 0; r < R; r++)
     {
-        float acc;
+        m_lane[r] = -3.4e38;
+        den_lane[r] = 0.0;
+    }
+
+    // ---- pass 1: скоры потока (j = ti, ti+WG, ...) для всех R строк,
+    // K-слово загружается один раз и скалярно умножается на R q-строк;
+    // running (max, den) каждой строки — в регистрах (online-рескейл)
+    float acc0[R], acc1[R], acc2[R], acc3[R];
+    for (uint j = ti; j < jmax_hi; j += WG)
+    {
+        [ForceUnroll]
+        for (uint r = 0; r < R; r++)
+        {
+            acc0[r] = 0.0; acc1[r] = 0.0; acc2[r] = 0.0; acc3[r] = 0.0;
+        }
         if (vec)
         {
-            uint4* k4 = (uint4*)pcs.tensor_k;
-            uint base4 = (b_idx * pcs.hkv + g) * pcs.s_dim * wcnt + j * wcnt;
-            float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
-            uint c = 0;
-            for (; c + 3 < wcnt; c += 4)
+            uint kb = kbase4 + j * wcnt;
+            for (uint c = 0; c < wcnt; c++)
             {
-                uint4 w0 = k4[base4 + c + 0];
-                uint4 w1 = k4[base4 + c + 1];
-                uint4 w2 = k4[base4 + c + 2];
-                uint4 w3 = k4[base4 + c + 3];
-                uint4 p0 = q4[qbase4 + c + 0];
-                uint4 p1 = q4[qbase4 + c + 1];
-                uint4 p2 = q4[qbase4 + c + 2];
-                uint4 p3 = q4[qbase4 + c + 3];
-                float4 l0 = f16tof32(w0), h0 = f16tof32(w0 >> 16);
-                float4 l1 = f16tof32(w1), h1 = f16tof32(w1 >> 16);
-                float4 l2 = f16tof32(w2), h2 = f16tof32(w2 >> 16);
-                float4 l3 = f16tof32(w3), h3 = f16tof32(w3 >> 16);
-                float4 u0 = f16tof32(p0), v0 = f16tof32(p0 >> 16);
-                float4 u1 = f16tof32(p1), v1 = f16tof32(p1 >> 16);
-                float4 u2 = f16tof32(p2), v2 = f16tof32(p2 >> 16);
-                float4 u3 = f16tof32(p3), v3 = f16tof32(p3 >> 16);
-                a0 += u0.x * l0.x + v0.x * h0.x;
-                a1 += u0.y * l0.y + v0.y * h0.y;
-                a2 += u0.z * l0.z + v0.z * h0.z;
-                a3 += u0.w * l0.w + v0.w * h0.w;
-                a0 += u1.x * l1.x + v1.x * h1.x;
-                a1 += u1.y * l1.y + v1.y * h1.y;
-                a2 += u1.z * l1.z + v1.z * h1.z;
-                a3 += u1.w * l1.w + v1.w * h1.w;
-                a0 += u2.x * l2.x + v2.x * h2.x;
-                a1 += u2.y * l2.y + v2.y * h2.y;
-                a2 += u2.z * l2.z + v2.z * h2.z;
-                a3 += u2.w * l2.w + v2.w * h2.w;
-                a0 += u3.x * l3.x + v3.x * h3.x;
-                a1 += u3.y * l3.y + v3.y * h3.y;
-                a2 += u3.z * l3.z + v3.z * h3.z;
-                a3 += u3.w * l3.w + v3.w * h3.w;
-            }
-            acc = (a0 + a1) + (a2 + a3);
-            for (; c < wcnt; c++)
-            {
-                uint4 w = k4[base4 + c];
-                uint4 p = q4[qbase4 + c];
-                float4 lo = f16tof32(w), hi = f16tof32(w >> 16);
-                float4 ql = f16tof32(p), qh = f16tof32(p >> 16);
-                acc += ql.x * lo.x + qh.x * hi.x
-                     + ql.y * lo.y + qh.y * hi.y
-                     + ql.z * lo.z + qh.z * hi.z
-                     + ql.w * lo.w + qh.w * hi.w;
+                uint4 wk = k4[kb + c];
+                float4 kl = f16tof32(wk), kh = f16tof32(wk >> 16);
+                [ForceUnroll]
+                for (uint r = 0; r < R; r++)
+                {
+                    uint4 pq = q4[qbase4 + r * wcnt + c];
+                    float4 ql = f16tof32(pq), qh = f16tof32(pq >> 16);
+                    acc0[r] += ql.x * kl.x + qh.x * kh.x;
+                    acc1[r] += ql.y * kl.y + qh.y * kh.y;
+                    acc2[r] += ql.z * kl.z + qh.z * kh.z;
+                    acc3[r] += ql.w * kl.w + qh.w * kh.w;
+                }
             }
         }
         else
         {
-            T* qrow = (T*)pcs.tensor_q + uint64_t(row) * pcs.hd;
-            T* krow = K + uint64_t(j) * pcs.hd;
-            float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
-            uint d = 0;
-            for (; d + 3 < pcs.hd; d += 4)
+            T* krow = K + j * pcs.hd;
+            [ForceUnroll]
+            for (uint r = 0; r < R; r++)
             {
-                a0 += castValue<T, float>(qrow[d]) * castValue<T, float>(krow[d]);
-                a1 += castValue<T, float>(qrow[d + 1]) * castValue<T, float>(krow[d + 1]);
-                a2 += castValue<T, float>(qrow[d + 2]) * castValue<T, float>(krow[d + 2]);
-                a3 += castValue<T, float>(qrow[d + 3]) * castValue<T, float>(krow[d + 3]);
+                T* qrow = (T*)pcs.tensor_q
+                    + (head * pcs.l_dim + i0 + r) * pcs.hd;
+                for (uint d = 0; d < pcs.hd; d++)
+                {
+                    float kv = castValue<T, float>(krow[d]);
+                    if (d % 4 == 0) acc0[r] += castValue<T, float>(qrow[d]) * kv;
+                    if (d % 4 == 1) acc1[r] += castValue<T, float>(qrow[d]) * kv;
+                    if (d % 4 == 2) acc2[r] += castValue<T, float>(qrow[d]) * kv;
+                    if (d % 4 == 3) acc3[r] += castValue<T, float>(qrow[d]) * kv;
+                }
             }
-            acc = (a0 + a1) + (a2 + a3);
-            for (; d < pcs.hd; d++)
-                acc += castValue<T, float>(qrow[d]) * castValue<T, float>(krow[d]);
         }
-        acc *= pcs.scale;
-        // online softmax update of the lane's running (max, denominator)
-        float m_new = max(m_lane, acc);
-        den_lane = den_lane * exp(m_lane - m_new) + exp(acc - m_new);
-        m_lane = m_new;
+        [ForceUnroll]
+        for (uint r = 0; r < R; r++)
+        {
+            uint im = i0 + r;
+            if (im < pcs.l_dim && j < im + 1 && j < pcs.s_dim)
+            {
+                float s = ((acc0[r] + acc1[r]) + (acc2[r] + acc3[r])) * pcs.scale;
+                float m_new = max(m_lane[r], s);
+                den_lane[r] = den_lane[r] * exp(m_lane[r] - m_new) + exp(s - m_new);
+                m_lane[r] = m_new;
+            }
+        }
     }
 
-    // group reduction of the lane (max, den) pairs into the row's (m, den):
-    // каждый поток сканирует весь scratch сам (как в исходном кернеле) —
-    // без serial-редукции одним потоком; m_glob/den_glob каждый поток
-    // вычисляет локально, broadcast не нужен
-    smem_red[ti] = m_lane;
-    GroupMemoryBarrierWithGroupSync();
-    float m_glob = -3.4e38;
+    // ---- групповая редукция (max, den) по строкам: R независимых цепочек
+    // чередуются в одном скане — латентность скана не умножается на R
     [ForceUnroll]
-    for (uint t = 0; t < WG; t++) m_glob = max(m_glob, smem_red[t]);
-    // барьер обязателен: ниже каждый поток ПЕРЕЗАПИСЫВАЕТ свой слот, а чужие
-    // сканы m_glob могли ещё не дочитать его
+    for (uint r = 0; r < R; r++) smem_red[r * WG + ti] = m_lane[r];
     GroupMemoryBarrierWithGroupSync();
-    // exp(m_lane - m_glob) <= 1; a lane with no scores (m_lane = -3.4e38,
-    // den_lane = 0) contributes exp(0)*0 = 0
-    smem_red[ti] = den_lane * exp(m_lane - m_glob);
-    GroupMemoryBarrierWithGroupSync();
-    float den_tot = 0;
+    float m_glob[R];
     [ForceUnroll]
-    for (uint t = 0; t < WG; t++) den_tot += smem_red[t];
-    float inv_den = 1.0 / den_tot;
-    // и перед перезаписью scratch весами chunk'а pass 2 — сканы den_tot тоже
-    // могли не завершиться
+    for (uint r = 0; r < R; r++) m_glob[r] = -3.4e38;
+    for (uint t = 0; t < WG; t++)
+    {
+        [ForceUnroll]
+        for (uint r = 0; r < R; r++) m_glob[r] = max(m_glob[r], smem_red[r * WG + t]);
+    }
+    // барьер до перезаписи scratch — чужие сканы могли не дочитать
+    GroupMemoryBarrierWithGroupSync();
+    [ForceUnroll]
+    for (uint r = 0; r < R; r++)
+    {
+        // exp(m_lane - m_glob) <= 1; пустая строка даёт exp(0)*0 = 0
+        smem_red[r * WG + ti] = den_lane[r] * exp(m_lane[r] - m_glob[r]);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    float inv_den[R];
+    [ForceUnroll]
+    for (uint r = 0; r < R; r++) inv_den[r] = 0.0;
+    for (uint t = 0; t < WG; t++)
+    {
+        [ForceUnroll]
+        for (uint r = 0; r < R; r++) inv_den[r] += smem_red[r * WG + t];
+    }
+    [ForceUnroll]
+    for (uint r = 0; r < R; r++) inv_den[r] = 1.0 / inv_den[r];
+    // и перед весами chunk'а pass 2 — сканы den тоже могли не завершиться
     GroupMemoryBarrierWithGroupSync();
 
-    // pass 2, chunked over the keys: recompute this thread's score (K is
-    // L1/L2-hot from pass 1), write the normalized prob (zero past the causal
-    // boundary — dV/dS read the full row), exchange the chunk's weights
-    // through the scratch and accumulate out[dim = ti] against them
-    float out_acc = 0.0;
+    // ---- pass 2, чанки по WG ключей: пересчёт скоров (K горячий в L1/L2),
+    // запись нормированных вероятностей (ноль за каузальной границей) и
+    // накопление out[dim = ti] против весов чанка: V читается ОДИН раз на
+    // все R строк
+    float acc0o[R], acc1o[R];
+    [ForceUnroll]
+    for (uint r = 0; r < R; r++)
+    {
+        acc0o[r] = 0.0;
+        acc1o[r] = 0.0;
+    }
     for (uint c0 = 0; c0 < pcs.s_dim; c0 += WG)
     {
         uint j = c0 + ti;
-        float w = 0.0;
-        if (j < jmax)
+        float w[R];
+        [ForceUnroll]
+        for (uint r = 0; r < R; r++) w[r] = 0.0;
+        if (j < jmax_hi)
         {
-            float s;
+            [ForceUnroll]
+            for (uint r = 0; r < R; r++) { acc0[r] = 0.0; acc1[r] = 0.0; acc2[r] = 0.0; acc3[r] = 0.0; }
             if (vec)
             {
-                uint4* k4 = (uint4*)pcs.tensor_k;
-                uint base4 = (b_idx * pcs.hkv + g) * pcs.s_dim * wcnt + j * wcnt;
-                float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
-                uint c = 0;
-                for (; c + 3 < wcnt; c += 4)
+                uint kb = kbase4 + j * wcnt;
+                for (uint c = 0; c < wcnt; c++)
                 {
-                    uint4 w0 = k4[base4 + c + 0];
-                    uint4 w1 = k4[base4 + c + 1];
-                    uint4 w2 = k4[base4 + c + 2];
-                    uint4 w3 = k4[base4 + c + 3];
-                    uint4 p0 = q4[qbase4 + c + 0];
-                    uint4 p1 = q4[qbase4 + c + 1];
-                    uint4 p2 = q4[qbase4 + c + 2];
-                    uint4 p3 = q4[qbase4 + c + 3];
-                    float4 l0 = f16tof32(w0), h0 = f16tof32(w0 >> 16);
-                    float4 l1 = f16tof32(w1), h1 = f16tof32(w1 >> 16);
-                    float4 l2 = f16tof32(w2), h2 = f16tof32(w2 >> 16);
-                    float4 l3 = f16tof32(w3), h3 = f16tof32(w3 >> 16);
-                    float4 u0 = f16tof32(p0), v0 = f16tof32(p0 >> 16);
-                    float4 u1 = f16tof32(p1), v1 = f16tof32(p1 >> 16);
-                    float4 u2 = f16tof32(p2), v2 = f16tof32(p2 >> 16);
-                    float4 u3 = f16tof32(p3), v3 = f16tof32(p3 >> 16);
-                    a0 += u0.x * l0.x + v0.x * h0.x;
-                    a1 += u0.y * l0.y + v0.y * h0.y;
-                    a2 += u0.z * l0.z + v0.z * h0.z;
-                    a3 += u0.w * l0.w + v0.w * h0.w;
-                    a0 += u1.x * l1.x + v1.x * h1.x;
-                    a1 += u1.y * l1.y + v1.y * h1.y;
-                    a2 += u1.z * l1.z + v1.z * h1.z;
-                    a3 += u1.w * l1.w + v1.w * h1.w;
-                    a0 += u2.x * l2.x + v2.x * h2.x;
-                    a1 += u2.y * l2.y + v2.y * h2.y;
-                    a2 += u2.z * l2.z + v2.z * h2.z;
-                    a3 += u2.w * l2.w + v2.w * h2.w;
-                    a0 += u3.x * l3.x + v3.x * h3.x;
-                    a1 += u3.y * l3.y + v3.y * h3.y;
-                    a2 += u3.z * l3.z + v3.z * h3.z;
-                    a3 += u3.w * l3.w + v3.w * h3.w;
-                }
-                s = (a0 + a1) + (a2 + a3);
-                for (; c < wcnt; c++)
-                {
-                    uint4 wk = k4[base4 + c];
-                    uint4 pk = q4[qbase4 + c];
-                    float4 lo = f16tof32(wk), hi = f16tof32(wk >> 16);
-                    float4 ql = f16tof32(pk), qh = f16tof32(pk >> 16);
-                    s += ql.x * lo.x + qh.x * hi.x
-                       + ql.y * lo.y + qh.y * hi.y
-                       + ql.z * lo.z + qh.z * hi.z
-                       + ql.w * lo.w + qh.w * hi.w;
+                    uint4 wk = k4[kb + c];
+                    float4 kl = f16tof32(wk), kh = f16tof32(wk >> 16);
+                    [ForceUnroll]
+                    for (uint r = 0; r < R; r++)
+                    {
+                        uint4 pq = q4[qbase4 + r * wcnt + c];
+                        float4 ql = f16tof32(pq), qh = f16tof32(pq >> 16);
+                        acc0[r] += ql.x * kl.x + qh.x * kh.x;
+                        acc1[r] += ql.y * kl.y + qh.y * kh.y;
+                        acc2[r] += ql.z * kl.z + qh.z * kh.z;
+                        acc3[r] += ql.w * kl.w + qh.w * kh.w;
+                    }
                 }
             }
             else
             {
-                T* qrow = (T*)pcs.tensor_q + uint64_t(row) * pcs.hd;
-                T* krow = K + uint64_t(j) * pcs.hd;
-                float a0 = 0, a1 = 0, a2 = 0, a3 = 0;
-                uint d = 0;
-                for (; d + 3 < pcs.hd; d += 4)
+                T* krow = K + j * pcs.hd;
+                [ForceUnroll]
+                for (uint r = 0; r < R; r++)
                 {
-                    a0 += castValue<T, float>(qrow[d]) * castValue<T, float>(krow[d]);
-                    a1 += castValue<T, float>(qrow[d + 1]) * castValue<T, float>(krow[d + 1]);
-                    a2 += castValue<T, float>(qrow[d + 2]) * castValue<T, float>(krow[d + 2]);
-                    a3 += castValue<T, float>(qrow[d + 3]) * castValue<T, float>(krow[d + 3]);
+                    T* qrow = (T*)pcs.tensor_q
+                        + (head * pcs.l_dim + i0 + r) * pcs.hd;
+                    for (uint d = 0; d < pcs.hd; d++)
+                    {
+                        float kv = castValue<T, float>(krow[d]);
+                        if (d % 4 == 0) acc0[r] += castValue<T, float>(qrow[d]) * kv;
+                        if (d % 4 == 1) acc1[r] += castValue<T, float>(qrow[d]) * kv;
+                        if (d % 4 == 2) acc2[r] += castValue<T, float>(qrow[d]) * kv;
+                        if (d % 4 == 3) acc3[r] += castValue<T, float>(qrow[d]) * kv;
+                    }
                 }
-                s = (a0 + a1) + (a2 + a3);
-                for (; d < pcs.hd; d++)
-                    s += castValue<T, float>(qrow[d]) * castValue<T, float>(krow[d]);
             }
-            w = exp(s * pcs.scale - m_glob);
+            [ForceUnroll]
+            for (uint r = 0; r < R; r++)
+            {
+                uint im = i0 + r;
+                if (im < pcs.l_dim && j < im + 1 && j < pcs.s_dim)
+                {
+                    float s = ((acc0[r] + acc1[r]) + (acc2[r] + acc3[r])) * pcs.scale;
+                    w[r] = exp(s - m_glob[r]);
+                }
+            }
         }
-        if (j < pcs.s_dim) prob_row[j] = castValue<float, T>(w * inv_den);
-        smem_red[ti] = w;
+        [ForceUnroll]
+        for (uint r = 0; r < R; r++)
+        {
+            if (i0 + r < pcs.l_dim && j < pcs.s_dim)
+            {
+                T* pr = prob_base + (i0 + r) * pcs.s_dim;
+                pr[j] = castValue<float, T>(w[r] * inv_den[r]);
+            }
+            smem_red[r * WG + ti] = w[r];
+        }
         GroupMemoryBarrierWithGroupSync();
 
-        // thread ti owns output dim ti over this chunk's keys
-        if (ti < pcs.hd && jmax > c0)
+        // thread ti владеет выходным измерением ti; V[j][ti] одна на R строк.
+        // Основной диапазон jj < jstop_0 свободен от пер-строчных гвардов
+        // (jstop растёт с r — строка 0 самая короткая), чтобы загрузки V
+        // конвейеризовались; хвост [jstop_0, jstop_max) — с гвардами.
+        // Основной диапазон раскручен ×4: четыре независимых загрузки V в
+        // полёте скрывают латентность L1 (серьяная цепочка load->FMA на
+        // MoltenVK не софт-пайплайнится компилятором)
+        if (ti < pcs.hd)
         {
-            uint jstop = min(jmax - c0, WG);
-            for (uint jj = 0; jj < jstop; jj++)
-                out_acc += smem_red[jj] * castValue<T, float>(V[uint64_t(c0 + jj) * pcs.hd + ti]);
+            uint jstop_0 = min(i0 + 1, pcs.s_dim) - c0; // строка 0 — самая короткая
+            // последняя активная строка тайла: тайл может пересекать границу l_dim
+            uint i_last = min(i0 + R, pcs.l_dim) - 1;
+            uint jstop_max = min(i_last + 1, pcs.s_dim) - c0;
+            uint chunk = min(pcs.s_dim - c0, (uint)WG);
+            uint main_stop = min(jstop_0, chunk);
+            uint main4 = main_stop & ~3u;
+            uint jj = 0;
+            for (; jj < main4; jj += 4)
+            {
+                float v0 = castValue<T, float>(V[(c0 + jj) * pcs.hd + ti]);
+                float v1 = castValue<T, float>(V[(c0 + jj + 1) * pcs.hd + ti]);
+                float v2 = castValue<T, float>(V[(c0 + jj + 2) * pcs.hd + ti]);
+                float v3 = castValue<T, float>(V[(c0 + jj + 3) * pcs.hd + ti]);
+                [ForceUnroll]
+                for (uint r = 0; r < R; r++)
+                {
+                    acc0o[r] += smem_red[r * WG + jj] * v0
+                        + smem_red[r * WG + jj + 2] * v2;
+                    acc1o[r] += smem_red[r * WG + jj + 1] * v1
+                        + smem_red[r * WG + jj + 3] * v3;
+                }
+            }
+            for (; jj + 1 < main_stop; jj += 2)
+            {
+                float v0 = castValue<T, float>(V[(c0 + jj) * pcs.hd + ti]);
+                float v1 = castValue<T, float>(V[(c0 + jj + 1) * pcs.hd + ti]);
+                [ForceUnroll]
+                for (uint r = 0; r < R; r++)
+                {
+                    acc0o[r] += smem_red[r * WG + jj] * v0;
+                    acc1o[r] += smem_red[r * WG + jj + 1] * v1;
+                }
+            }
+            if (main_stop & 1) // нечётный остаток основного диапазона
+            {
+                uint jj = main_stop - 1;
+                float v0 = castValue<T, float>(V[(c0 + jj) * pcs.hd + ti]);
+                [ForceUnroll]
+                for (uint r = 0; r < R; r++) acc0o[r] += smem_red[r * WG + jj] * v0;
+            }
+            for (uint jj = main_stop; jj < min(jstop_max, chunk); jj++)
+            {
+                float v0 = castValue<T, float>(V[(c0 + jj) * pcs.hd + ti]);
+                [ForceUnroll]
+                for (uint r = 0; r < R; r++)
+                {
+                    uint jstop = (i0 + r < pcs.l_dim) ? min(i0 + r + 1, pcs.s_dim) - c0 : 0;
+                    if (jj < jstop) acc0o[r] += smem_red[r * WG + jj] * v0;
+                }
+            }
         }
-        GroupMemoryBarrierWithGroupSync(); // smem_red is reused by the next chunk
+        GroupMemoryBarrierWithGroupSync(); // smem_red переиспользуется следующим чанком
     }
 
     if (ti < pcs.hd)
     {
-        T* out_row = (T*)pcs.tensor_out + uint64_t(row) * pcs.hd;
-        out_row[ti] = castValue<float, T>(out_acc * inv_den);
+        [ForceUnroll]
+        for (uint r = 0; r < R; r++)
+        {
+            if (i0 + r < pcs.l_dim)
+            {
+                T* out_row = (T*)pcs.tensor_out
+                    + (head * pcs.l_dim + i0 + r) * pcs.hd;
+                out_row[ti] = castValue<float, T>((acc0o[r] + acc1o[r]) * inv_den[r]);
+            }
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
 // delta: delta[r] = sum_d dO[r, d] * out[r, d], one thread per row
 // ---------------------------------------------------------------------------
 

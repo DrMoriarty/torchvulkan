@@ -12,17 +12,14 @@
 // The math decomposition materializes B*H*T*T fp32 scores and runs softmax and
 // the whole backward as dozens of pointwise/reduction kernels through the
 // dispatcher; here the forward is one kernel (sdpa_fwd_main: QK^T + softmax +
-// P*V, one workgroup per q row, scores in groupshared memory) and the backward
-// is two private kernels (delta rowdot, dS = P*(dP - delta)) plus four regular
-// matmul dispatches (dP, dQ, dK, dV) on grouped views that keep GQA batched at
-// B*Hkv without expanding K/V:
-//
-//   delta = rowdot(dO, out)                     (B*Hq*L) fp32
-//   dP    = dO_g @ V^T                          (B, Hkv, qpg*L, S)
-//   dS    = P * (dP - delta[row]), j > i -> 0   same layout as P
-//   dQ    = dS_g @ K      -> (B, Hq, L, hd)
-//   dK    = dS_g^T @ Q_g  -> (B, Hkv, S, hd)
-//   dV    = P_g^T @ dO_g  -> (B, Hkv, S, hd)
+// P*V, one workgroup per R-row tile, scores streamed, P materialized) and the
+// backward is two private kernels (delta rowdot, dS = P*(dP - delta)) plus
+// four regular matmul dispatches (dP, dQ, dK, dV) on grouped views that keep
+// GQA batched at B*Hkv without expanding K/V. A fully fused backward (FA2-
+// style, per-thread rows/columns, no dP materialization) was implemented and
+// benchmarked during A5 and lost to these four GEMM dispatches on the 5300M
+// (~1.5 vs ~1.1 ms of GPU time at B8/H8/T128/hd64 — see §9), so the GEMM
+// composition stayed.
 //
 // Routing: aten::scaled_dot_product_attention is overridden under
 // AutogradPrivateUse1 (the op itself is CompositeImplicitAutograd, so a backend
@@ -34,6 +31,9 @@ namespace torchvulkan {
 namespace {
 
 constexpr uint32_t SDPA_WG = 128;
+// q-строк на workgroup в fwd/bwd (row-tiling, generic R в sdpa.slang;
+// константа в config.py должна совпадать)
+constexpr int64_t SDPA_ROWS_R = 4;
 // historical cap of the single-pass kernel (score row in groupshared memory);
 // the two-pass kernel keeps only a 128-float scratch, but the probs
 // materialization B*Hkv*qpg*L*S makes larger rows pointless anyway
@@ -109,10 +109,14 @@ std::tuple<at::Tensor, at::Tensor> sdpa_causal_fwd(const at::Tensor& q, const at
     at::Tensor vc = v.contiguous();
 
     DeviceContext* device = get_device_context(qc);
-    const uint32_t rows_x = sdpa_grid_rows(rows, device);
-    const uint32_t grid_y = static_cast<uint32_t>((rows + rows_x - 1) / rows_x);
-    TORCH_CHECK(int64_t(rows_x) * grid_y >= rows && grid_y <= device->properties.limits.maxComputeWorkGroupCount[1],
-        "torchvulkan [ERROR]: sdpa_fwd row count ", rows, " exceeds the device workgroup limit.");
+    // row-tiling: один WG обрабатывает SDPA_ROWS_R подряд идущих строк
+    // одной головы (tph тайлов на голову), сетка по тайлам
+    const int64_t tph = (l + SDPA_ROWS_R - 1) / SDPA_ROWS_R;
+    const int64_t tiles = b * hq * tph;
+    const uint32_t rows_x = sdpa_grid_rows(tiles, device);
+    const uint32_t grid_y = static_cast<uint32_t>((tiles + rows_x - 1) / rows_x);
+    TORCH_CHECK(int64_t(rows_x) * grid_y >= tiles && grid_y <= device->properties.limits.maxComputeWorkGroupCount[1],
+        "torchvulkan [ERROR]: sdpa_fwd tile count ", tiles, " exceeds the device workgroup limit.");
 
     materialize_cow(qc);
     materialize_cow(kc);
@@ -135,6 +139,7 @@ std::tuple<at::Tensor, at::Tensor> sdpa_causal_fwd(const at::Tensor& q, const at
     pcs.push(static_cast<uint32_t>(s));
     pcs.push(static_cast<uint32_t>(hd));
     pcs.push(rows_x);
+    pcs.push(static_cast<uint32_t>(tph));
     pcs.push(static_cast<float>(scale));
 
     device->shader_manager->dispatchShader(

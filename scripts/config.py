@@ -287,12 +287,14 @@ KERNELS = [
         Entry('attn_decode_main', [F16], (), constants=(128,)),
     ]),
     # fused causal SDPA (training path, A5): fwd = QK^T + softmax + P·V одним
-    # кернелом (один WG на q-строку, двухпроходный streaming-softmax, scratch
-    # 128 float) + P в глобальной памяти для backward; rowdot/dS — backward-
-    # хелперы, GEMM'ы dP/dQ/dK/dV остаются на обычном matmul. WG — compile-time
-    # константа
+    # кернелом (один WG на R q-строк, двухпроходный streaming-softmax) + P в
+    # глобальной памяти; backward — rowdot/dS-хелперы + четыре GEMM'а на
+    # обычном matmul (fused-бэкворд проиграл GEMM'ам на 5300M, см. §9).
+    # WG — compile-time константа
     Kernel('sdpa_fwd', 'ops/sdpa.slang', [
-        Entry('sdpa_fwd_main', [F16, F32], (), constants=(128,)),
+        # R = 4 строк на workgroup (row-tiling); должно совпадать с
+        # SDPA_ROWS_R в src/api/ops/sdpa.cpp
+        Entry('sdpa_fwd_main', [F16, F32], (), constants=(128, 4)),
     ]),
     Kernel('sdpa_rowdot', 'ops/sdpa.slang', [
         Entry('sdpa_rowdot_main', [F16, F32]),
