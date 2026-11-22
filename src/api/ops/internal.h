@@ -65,6 +65,26 @@ at::Tensor attn_decode(const at::Tensor& q, const at::Tensor& k_cache, const at:
     const c10::optional<at::Tensor>& qkn_w, const c10::optional<at::Tensor>& cos_t,
     const c10::optional<at::Tensor>& sin_t, const c10::optional<double>& eps);
 
+// ops/sdpa.cpp — fused causal SDPA (training path, A5)
+bool sdpa_route_ok(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    const c10::optional<at::Tensor>& attn_mask, double dropout_p, bool is_causal,
+    bool enable_gqa);
+std::tuple<at::Tensor, at::Tensor> sdpa_causal_fwd(const at::Tensor& q, const at::Tensor& k,
+    const at::Tensor& v, double scale);
+at::Tensor sdpa_rowdot(const at::Tensor& a, const at::Tensor& b);
+at::Tensor sdpa_ds(const at::Tensor& probs, const at::Tensor& dP, const at::Tensor& delta,
+    int64_t l, double scale);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> sdpa_causal_backward(const at::Tensor& grad_out,
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& out,
+    const at::Tensor& probs, double scale);
+at::Tensor scaled_dot_product_attention_vulkan(const at::Tensor& q, const at::Tensor& k,
+    const at::Tensor& v, const c10::optional<at::Tensor>& attn_mask, double dropout_p,
+    bool is_causal, c10::optional<double> scale, bool enable_gqa);
+std::tuple<at::Tensor, at::Tensor> scaled_dot_product_attention_math_vulkan(
+    const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    const c10::optional<at::Tensor>& attn_mask, double dropout_p, bool is_causal,
+    const c10::optional<at::Tensor>& dropout_mask, c10::optional<double> scale, bool enable_gqa);
+
 // ops/binary.cpp
 at::Tensor silu_mul_vulkan(const at::Tensor& g, const at::Tensor& u);
 

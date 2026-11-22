@@ -286,6 +286,20 @@ KERNELS = [
     Kernel('attn_decode', 'ops/attn_decode.slang', [
         Entry('attn_decode_main', [F16], (), constants=(128,)),
     ]),
+    # fused causal SDPA (training path, A5): fwd = QK^T + softmax + P·V одним
+    # кернелом (один WG на q-строку, двухпроходный streaming-softmax, scratch
+    # 128 float) + P в глобальной памяти для backward; rowdot/dS — backward-
+    # хелперы, GEMM'ы dP/dQ/dK/dV остаются на обычном matmul. WG — compile-time
+    # константа
+    Kernel('sdpa_fwd', 'ops/sdpa.slang', [
+        Entry('sdpa_fwd_main', [F16, F32], (), constants=(128,)),
+    ]),
+    Kernel('sdpa_rowdot', 'ops/sdpa.slang', [
+        Entry('sdpa_rowdot_main', [F16, F32]),
+    ]),
+    Kernel('sdpa_ds', 'ops/sdpa.slang', [
+        Entry('sdpa_ds_main', [F16, F32]),
+    ]),
     Kernel('conv_128', 'ops/conv.slang', [
         Entry('conv_main', [d for d in FLOATS if d.bytes < 8], ('vec',), constants=(128,)),
     ]),
