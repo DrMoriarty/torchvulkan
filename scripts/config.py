@@ -342,4 +342,24 @@ KERNELS = [
     Kernel('rms_norm_bwd', 'ops/rms_norm_bwd.slang', [
         Entry('rms_norm_bwd_main', [F16, F32]),
     ]),
+    # fused train-path cross-entropy (lm_head, experiments/lfm2_train_profile.md
+    # приоритет 2): fwd — GEMM логитов (единственная materialизация [rows, V],
+    # fp16) + кернел max/sum-exp, воспроизводящий ПОРЯДОК суммирования
+    # reduce_tree (бит-в-бит с aten log_softmax), с gather'ом target-logit и
+    # построчным loss; backward — кернел grad_logits поверх сохранённых логитов
+    # (in place) + два обычных aten-mm (grad_h, grad_W). 5 диспетчей на fwd+bwd
+    # вместо ~15, без fp32-копий [rows, V]. WG ce_lse — compile-time константа,
+    # равная tree_wg reduce.cpp (128): определяет порядок суммирования
+    Kernel('ce_lse', 'ops/cross_entropy.slang', [
+        Entry('ce_lse_main', [F16, F32], (), constants=(128,)),
+    ]),
+    Kernel('ce_transpose', 'ops/cross_entropy.slang', [
+        Entry('ce_transpose_main', [F16, F32]),
+    ]),
+    Kernel('ce_shift', 'ops/cross_entropy.slang', [
+        Entry('ce_shift_main', [F16, F32], (), constants=(256,)),
+    ]),
+    Kernel('ce_grad', 'ops/cross_entropy.slang', [
+        Entry('ce_grad_main', [F16, F32], (), constants=(256,)),
+    ]),
 ]

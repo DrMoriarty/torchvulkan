@@ -16,6 +16,8 @@ import torch
 
 _rms_fwd_op = torch.ops.torchvulkan.rms_norm_train_fwd
 _rms_bwd_op = torch.ops.torchvulkan.rms_norm_train_bwd
+_ce_fwd_op = torch.ops.torchvulkan.ce_fwd
+_ce_bwd_op = torch.ops.torchvulkan.ce_bwd
 
 
 class _FusedRMSNorm(torch.autograd.Function):
@@ -85,3 +87,73 @@ def unpatch_rms_norm_modules(model: torch.nn.Module) -> int:
             del module.__dict__["forward"]
             removed += 1
     return removed
+
+
+class _FusedCrossEntropy(torch.autograd.Function):
+    """Fused chunked-memory cross-entropy over the lm_head projection.
+
+    forward:  logits = h @ weight.T      (single fp16 [N, V] buffer, the only
+                                          [N, V] materialization — no fp32 copy)
+              loss_r = -((x32[t] - max) - log(sum(exp)))  (fused kernel, per row;
+                                          the sum replays reduce_tree's order, so
+                                          the loss is bit-identical to aten CE)
+    backward: grad_logits = (softmax - onehot) * g_row   (fused kernel, in place
+                                          over the saved logits buffer)
+              grad_h   = grad_logits @ weight
+              grad_W   = grad_logits.T @ h          (with tied embeddings this
+                                          is the embedding gradient)
+    5 dispatches per fwd+bwd instead of ~15 aten ops; peak CE memory is one
+    [N, V] activation-dtype buffer (~256 MB fp16 at N=2048, V=65536) instead of
+    ~1.5 GB of fp32 logits + intermediates.
+    """
+
+    @staticmethod
+    def forward(ctx, h, weight, target, ignore_index, reduction):
+        h2d = h.reshape(-1, h.shape[-1])
+        tgt = target.reshape(-1)
+        loss_rows, logits, mx, log_s = _ce_fwd_op(h2d, weight, tgt, ignore_index)
+        ctx.save_for_backward(h2d, weight, mx, log_s, tgt)
+        ctx.logits = logits  # consumed in place by the backward kernel
+        ctx.h_shape = h.shape
+        ctx.ignore_index = ignore_index
+        ctx.reduction = reduction
+        if reduction == "none":
+            return loss_rows.view(target.shape)
+        if reduction == "sum":
+            return loss_rows.sum()
+        # 'mean': aten divides the sum by the number of non-ignored targets
+        valid = (tgt != ignore_index).sum()
+        return loss_rows.sum() / valid
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        h2d, weight, mx, log_s, tgt = ctx.saved_tensors
+        n = tgt.numel()
+        if ctx.reduction == "none":
+            grad_rows = grad_out.reshape(-1).float()
+        else:
+            g = grad_out
+            if ctx.reduction == "mean":
+                valid = (tgt != ctx.ignore_index).sum()
+                g = g / valid
+            # materialize the uniform per-row scales as one fp32 vector
+            grad_rows = g.float().expand(n).contiguous()
+        grad_h2d, grad_w = _ce_bwd_op(
+            grad_rows, ctx.logits, mx, log_s, tgt, h2d, weight, ctx.ignore_index)
+        return grad_h2d.reshape(ctx.h_shape), grad_w, None, None, None
+
+
+def fused_cross_entropy(h: torch.Tensor, weight: torch.Tensor, target: torch.Tensor,
+                        ignore_index: int = -100, reduction: str = "mean") -> torch.Tensor:
+    """Fused train-path cross-entropy over the lm_head projection.
+
+    h: (..., H) fp16/fp32 vulkan hidden states; weight: (V, H) lm_head /
+    tied-embedding matrix (logits = h @ weight.T); target: (...,) int64 labels
+    aligned with the leading dims of h (values >= V or == ignore_index are
+    ignored — only ignore_index semantics of aten cross_entropy, no class
+    weights / label smoothing). reduction: 'mean' | 'sum' | 'none'.
+
+    Replaces `cross_entropy(h @ weight.T, target)` without materializing fp32
+    logits: peak CE memory is one [N, V] buffer in the dtype of h.
+    """
+    return _FusedCrossEntropy.apply(h, weight, target, ignore_index, reduction)

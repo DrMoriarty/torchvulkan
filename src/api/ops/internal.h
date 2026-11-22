@@ -91,6 +91,14 @@ std::tuple<at::Tensor, at::Tensor> scaled_dot_product_attention_math_vulkan(
 // ops/binary.cpp
 at::Tensor silu_mul_vulkan(const at::Tensor& g, const at::Tensor& u);
 
+// ops/ce.cpp — fused train-path cross-entropy (lm_head); the autograd pair
+// lives in torchvulkan/fused_train.py
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> ce_fwd(const at::Tensor& h,
+    const at::Tensor& weight, const at::Tensor& target, int64_t ignore_index);
+std::tuple<at::Tensor, at::Tensor> ce_bwd(const at::Tensor& grad_rows, const at::Tensor& logits,
+    const at::Tensor& mx, const at::Tensor& log_s, const at::Tensor& target, const at::Tensor& h,
+    const at::Tensor& weight, int64_t ignore_index);
+
 // ops/unary.cpp
 at::Tensor gelu_native_vulkan(const at::Tensor& self);
 
