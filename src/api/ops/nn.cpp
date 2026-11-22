@@ -40,6 +40,261 @@ at::Tensor batch_norm_apply(const at::Tensor& x, const at::Tensor& mean, const a
     return y;
 }
 
+// ---- fused native batch_norm (A4, experiments/training_speedup.md) ----
+// The aten composition materialises an fp32 copy and runs three sequential
+// multi-dim reductions plus a pointwise var/apply chain — 15-20 kernels per
+// training fwd and about the same in the decomposed backward. The fused path
+// (src/shaders/ops/batch_norm.slang) needs three kernels per call:
+//   BN_PARTIALS  per (channel, chunk) fp32 (sum, sumsq) [fwd] or
+//                (sum_dy, sum_dy*xhat) [backward] over the NCHW blocks;
+//   BN_FINALIZE  per-channel fold: fwd -> mean/rstd + fp32 saves + running
+//                stats update; backward -> grad_bias/grad_weight (raw sums);
+//   BN_APPLY     normalization / grad_input elementwise pass.
+
+constexpr uint32_t BN_WG = 128;
+constexpr int64_t BN_CHUNK_MIN = 1024;   // elements per phase-0 chunk
+constexpr int64_t BN_MAX_CHUNKS = 128;   // = the finalize fold width (WG)
+constexpr int64_t BN_GRID_TARGET = 8192; // phase-0 workgroups overall
+
+// spatial size of one (batch, channel) block: product of dims 2..
+int64_t bn_spatial(const at::Tensor& input)
+{
+    int64_t S = 1;
+    for (int64_t d = 2; d < input.dim(); d++) S *= input.size(d);
+    return S;
+}
+
+bool bn_fused_supported(const at::Tensor& input, const at::Tensor& weight, const at::Tensor& bias)
+{
+    // A/B kill-switch for benchmarks and diagnostics: TORCHVULKAN_NO_FUSED_BN=1
+    // restores the aten composition
+    static const bool disabled = std::getenv("TORCHVULKAN_NO_FUSED_BN") != nullptr;
+    if (disabled) return false;
+    at::ScalarType st = input.scalar_type();
+    if (st != at::kHalf && st != at::kFloat) return false;
+    if (input.dim() < 2 || input.numel() == 0 || !input.is_contiguous()) return false;
+    if (!is_dtype_supported(input, st) || !fits_32bit_indexing({input})) return false;
+    if (input.size(1) <= 0 || input.size(0) <= 0) return false;
+    if (weight.defined() && (weight.dim() != 1 || weight.scalar_type() != st || !weight.is_contiguous())) return false;
+    if (bias.defined() && (bias.dim() != 1 || bias.scalar_type() != st || !bias.is_contiguous())) return false;
+    return true;
+}
+
+bool bn_running_supported(const at::Tensor& input, const at::Tensor& running_mean, const at::Tensor& running_var)
+{
+    const int64_t C = input.size(1);
+    auto ok = [&](const at::Tensor& t) {
+        return !t.defined() || (t.dim() == 1 && t.numel() == C && t.is_contiguous()
+            && (t.scalar_type() == at::kHalf || t.scalar_type() == at::kFloat)
+            && fits_32bit_indexing({t}));
+    };
+    return ok(running_mean) && ok(running_var);
+}
+
+void bn_chunking(int64_t nhw, int64_t C, int64_t& n_chunks, int64_t& chunk_size)
+{
+    n_chunks = std::min<int64_t>((nhw + BN_CHUNK_MIN - 1) / BN_CHUNK_MIN, BN_MAX_CHUNKS);
+    n_chunks = std::min<int64_t>(std::max<int64_t>(n_chunks, 1), std::max<int64_t>(BN_GRID_TARGET / C, 1));
+    chunk_size = (nhw + n_chunks - 1) / n_chunks;
+    chunk_size = (chunk_size + 15) / 16 * 16; // 16-element alignment for the vector body
+    n_chunks = (nhw + chunk_size - 1) / chunk_size;
+}
+
+void bn_grid(uint64_t work, const DeviceContext* device, uint32_t& gx, uint32_t& gy)
+{
+    const uint64_t max_groups_x = device->properties.limits.maxComputeWorkGroupCount[0];
+    const uint64_t max_groups_y = device->properties.limits.maxComputeWorkGroupCount[1];
+    const uint64_t groups_row = std::min<uint64_t>(GROUP_ROW, max_groups_x);
+    gy = static_cast<uint32_t>((work + groups_row - 1) / groups_row);
+    TORCH_CHECK(gy <= max_groups_y, "torchvulkan [ERROR]: batch_norm grid (", work, " workgroups) exceeds the device limit.");
+    gx = static_cast<uint32_t>(std::min<uint64_t>(work, groups_row));
+}
+
+// the partials pass: mode 0 (fwd statistics) or 1 (backward sums)
+at::Tensor bn_partials_kernel(const at::Tensor& x, const at::Tensor& dy, const at::Tensor& mean32,
+    const at::Tensor& rstd32, int64_t C, int64_t S, int64_t nhw, int64_t n_chunks, int64_t chunk_size, int mode)
+{
+    at::Tensor partial = at::empty({C * n_chunks * 2}, x.options().dtype(at::kFloat));
+    DeviceContext* device = get_device_context(x);
+    materialize_cow(x);
+    if (dy.defined()) materialize_cow(dy);
+
+    SpecializationBuilder spd{};
+    PushConstantBuilder pcs{};
+    pcs.push(get_tensor_address(x))
+       .push(dy.defined() ? get_tensor_address(dy) : uint64_t(0))
+       .push(mean32.defined() ? get_tensor_address(mean32) : uint64_t(0))
+       .push(rstd32.defined() ? get_tensor_address(rstd32) : uint64_t(0))
+       .push(get_output_address(partial))
+       .push(static_cast<uint32_t>(C))
+       .push(static_cast<uint32_t>(S))
+       .push(static_cast<uint32_t>(nhw))
+       .push(static_cast<uint32_t>(n_chunks))
+       .push(static_cast<uint32_t>(chunk_size))
+       .push(static_cast<uint32_t>(mode));
+
+    uint32_t gx, gy;
+    bn_grid(static_cast<uint64_t>(C) * n_chunks, device, gx, gy);
+    std::vector<at::Tensor> reads = {x};
+    if (dy.defined()) reads.push_back(dy);
+    if (mean32.defined()) { reads.push_back(mean32); reads.push_back(rstd32); }
+    device->shader_manager->dispatchShader(
+        ShaderKey{torchvulkan::Kernel::BN_PARTIALS, x.scalar_type()},
+        device->default_subgroup_size, spd.build(), pcs.build(),
+        reads, {partial}, gx, gy, 1);
+    return partial;
+}
+
+// the per-channel fold: mode 0 -> save_mean/save_rstd (fp32) + running stats;
+// mode 1 -> grad_bias/grad_weight in the parameter dtype T
+void bn_finalize_kernel(const at::Tensor& partial, int64_t C, int64_t n_chunks, int64_t nhw,
+    double momentum, double eps, at::Tensor& out0, at::Tensor& out1,
+    const at::Tensor& running_mean, const at::Tensor& running_var, at::ScalarType param_dt, int mode)
+{
+    DeviceContext* device = get_device_context(partial);
+    bool has_rm = mode == 0 && running_mean.defined();
+    bool has_rv = mode == 0 && running_var.defined();
+
+    SpecializationBuilder spd{};
+    PushConstantBuilder pcs{};
+    pcs.push(get_tensor_address(partial))
+       .push(get_output_address(out0))
+       .push(get_output_address(out1))
+       .push(has_rm ? get_tensor_address(running_mean) : uint64_t(0))
+       .push(has_rv ? get_tensor_address(running_var) : uint64_t(0))
+       .push(static_cast<uint32_t>(C))
+       .push(static_cast<uint32_t>(n_chunks))
+       .push(static_cast<uint32_t>(nhw))
+       .push(static_cast<float>(momentum))
+       .push(static_cast<float>(eps))
+       .push(static_cast<float>(nhw > 1 ? double(nhw) / double(nhw - 1) : 1.0))
+       .push(static_cast<uint32_t>(mode));
+
+    std::vector<at::Tensor> reads = {partial};
+    std::vector<at::Tensor> writes = {out0, out1};
+    if (has_rm) { reads.push_back(running_mean); writes.push_back(running_mean); }
+    if (has_rv) { reads.push_back(running_var); writes.push_back(running_var); }
+    device->shader_manager->dispatchShader(
+        ShaderKey{torchvulkan::Kernel::BN_FINALIZE, param_dt},
+        device->default_subgroup_size, spd.build(), pcs.build(),
+        reads, writes, static_cast<uint32_t>((C + BN_WG - 1) / BN_WG), 1, 1);
+}
+
+// the elementwise pass, one workgroup per (channel, chunk): dy undefined ->
+// fwd apply (mode 0), else grad_input (mode 1, train/eval via the flag)
+at::Tensor bn_apply_kernel(const at::Tensor& x, const at::Tensor& mean32, const at::Tensor& rstd32,
+    const at::Tensor& weight, const at::Tensor& bias, const at::Tensor& dy,
+    const at::Tensor& sum_dy, const at::Tensor& sum_dy_xhat, bool train, double inv_n)
+{
+    at::Tensor out = at::empty_like(x);
+    DeviceContext* device = get_device_context(x);
+    materialize_cow(x);
+    if (dy.defined()) materialize_cow(dy);
+
+    const int64_t C = x.size(1);
+    const int64_t S = bn_spatial(x);
+    const int64_t nhw = x.numel() / C;
+    int64_t n_chunks, chunk_size;
+    bn_chunking(nhw, C, n_chunks, chunk_size);
+    uint32_t flags = (weight.defined() ? 1u : 0u) | (bias.defined() ? 2u : 0u) | (train ? 4u : 0u);
+
+    SpecializationBuilder spd{};
+    PushConstantBuilder pcs{};
+    pcs.push(get_tensor_address(x))
+       .push(dy.defined() ? get_tensor_address(dy) : uint64_t(0))
+       .push(get_tensor_address(mean32))
+       .push(get_tensor_address(rstd32))
+       .push(weight.defined() ? get_tensor_address(weight) : uint64_t(0))
+       .push(bias.defined() ? get_tensor_address(bias) : uint64_t(0))
+       .push(sum_dy.defined() ? get_tensor_address(sum_dy) : uint64_t(0))
+       .push(sum_dy_xhat.defined() ? get_tensor_address(sum_dy_xhat) : uint64_t(0))
+       .push(get_output_address(out))
+       .push(static_cast<uint32_t>(S))
+       .push(static_cast<uint32_t>(C))
+       .push(static_cast<uint32_t>(nhw))
+       .push(static_cast<uint32_t>(n_chunks))
+       .push(static_cast<uint32_t>(chunk_size))
+       .push(flags)
+       .push(static_cast<float>(inv_n))
+       .push(dy.defined() ? 1u : 0u);
+
+    uint32_t gx, gy;
+    bn_grid(static_cast<uint64_t>(C) * n_chunks, device, gx, gy);
+    std::vector<at::Tensor> reads = {x, mean32, rstd32};
+    if (weight.defined()) reads.push_back(weight);
+    if (bias.defined()) reads.push_back(bias);
+    if (dy.defined()) { reads.push_back(dy); if (train) { reads.push_back(sum_dy); reads.push_back(sum_dy_xhat); } }
+    device->shader_manager->dispatchShader(
+        ShaderKey{torchvulkan::Kernel::BN_APPLY, x.scalar_type()},
+        device->default_subgroup_size, spd.build(), pcs.build(),
+        reads, {out}, gx, gy, 1);
+    return out;
+}
+
+// fused training forward: statistics + normalization + running-stats update in
+// three kernels; returns (out, save_mean, save_rstd), saves fp32 as aten does
+std::tuple<at::Tensor, at::Tensor, at::Tensor> batch_norm_train_fused(
+    const at::Tensor& input, const at::Tensor& weight, const at::Tensor& bias,
+    const at::Tensor& running_mean, const at::Tensor& running_var,
+    double momentum, double eps)
+{
+    const int64_t C = input.size(1);
+    const int64_t nhw = input.numel() / C;
+    int64_t n_chunks, chunk_size;
+    bn_chunking(nhw, C, n_chunks, chunk_size);
+
+    at::Tensor partial = bn_partials_kernel(input, at::Tensor(), at::Tensor(), at::Tensor(),
+        C, bn_spatial(input), nhw, n_chunks, chunk_size, /*mode=*/0);
+
+    at::Tensor save_mean = at::empty({C}, input.options().dtype(at::kFloat));
+    at::Tensor save_rstd = at::empty({C}, input.options().dtype(at::kFloat));
+    at::ScalarType run_dt = running_mean.defined() ? running_mean.scalar_type()
+                          : running_var.defined() ? running_var.scalar_type() : at::kFloat;
+    bn_finalize_kernel(partial, C, n_chunks, nhw, momentum, eps, save_mean, save_rstd,
+        running_mean, running_var, run_dt, /*mode=*/0);
+
+    at::Tensor out = bn_apply_kernel(input, save_mean, save_rstd, weight, bias,
+        at::Tensor(), at::Tensor(), at::Tensor(), /*train=*/false, 0.0);
+    return std::make_tuple(out, save_mean, save_rstd);
+}
+
+// fused backward: (grad_bias, grad_weight) from one sums pass, grad_input from
+// the apply pass — three kernels in total (two when only grad_input is asked
+// for in eval mode)
+std::tuple<at::Tensor, at::Tensor, at::Tensor> batch_norm_backward_fused(
+    const at::Tensor& grad_out, const at::Tensor& input, const at::Tensor& weight,
+    const at::Tensor& mean32, const at::Tensor& rstd32,
+    bool train, std::array<bool, 3> output_mask)
+{
+    const int64_t C = input.size(1);
+    const int64_t nhw = input.numel() / C;
+    int64_t n_chunks, chunk_size;
+    bn_chunking(nhw, C, n_chunks, chunk_size);
+
+    at::Tensor grad_input, grad_weight, grad_bias;
+    const bool need_sums = (train && output_mask[0]) || output_mask[1] || output_mask[2];
+    at::Tensor sum_dy, sum_dy_xhat;
+    if (need_sums)
+    {
+        at::Tensor partial = bn_partials_kernel(input, grad_out, mean32, rstd32,
+            C, bn_spatial(input), nhw, n_chunks, chunk_size, /*mode=*/1);
+        at::ScalarType param_dt = weight.defined() ? weight.scalar_type() : input.scalar_type();
+        // grad_bias (= sum_dy) / grad_weight (= sum_dy_xhat) land in the param
+        // dtype straight from the fold
+        grad_bias = at::empty({C}, input.options().dtype(param_dt));
+        grad_weight = at::empty({C}, input.options().dtype(param_dt));
+        bn_finalize_kernel(partial, C, n_chunks, nhw, 0.0, 0.0, grad_bias, grad_weight,
+            at::Tensor(), at::Tensor(), param_dt, /*mode=*/1);
+        // the apply kernel reads its per-channel params as fp32
+        sum_dy = grad_bias.to(at::kFloat);
+        sum_dy_xhat = grad_weight.to(at::kFloat);
+    }
+    if (output_mask[0])
+        grad_input = bn_apply_kernel(input, mean32, rstd32, weight, at::Tensor(),
+            grad_out, sum_dy, sum_dy_xhat, train, 1.0 / static_cast<double>(nhw));
+    return std::make_tuple(grad_input, grad_weight, grad_bias);
+}
+
 std::tuple<at::Tensor, at::Tensor, at::Tensor> batch_norm_forward(
     const at::Tensor& input,
     const at::Tensor& weight,
@@ -52,6 +307,24 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> batch_norm_forward(
 {
     TORCH_CHECK(input.dim() >= 2, "batch_norm: expected input to have at least 2 dimensions, got ", input.dim());
     at::ScalarType dtype = input.scalar_type();
+
+    // fused fast path (A4, experiments/training_speedup.md): native partials /
+    // finalize / apply kernels instead of the aten composition
+    if (bn_fused_supported(input, weight, bias) && bn_running_supported(input, running_mean, running_var))
+    {
+        if (!training)
+        {
+            TORCH_CHECK(running_mean.defined() && running_var.defined(), "running_mean and running_var must be defined in evaluation mode");
+            at::Tensor mean32 = running_mean.to(at::kFloat).contiguous();
+            at::Tensor rstd32 = at::rsqrt(at::add(running_var.to(at::kFloat), eps)).contiguous();
+            at::Tensor y = bn_apply_kernel(input, mean32, rstd32, weight, bias,
+                at::Tensor(), at::Tensor(), at::Tensor(), /*train=*/false, 0.0);
+            at::Tensor empty = at::empty({0}, input.options());
+            return std::make_tuple(y, empty, empty.clone());
+        }
+        return batch_norm_train_fused(input, weight, bias, running_mean, running_var, momentum, eps);
+    }
+
     at::Tensor x = is_low_prec(dtype) ? input.to(at::kFloat) : input;
     std::vector<int64_t> dims = batch_norm_dims(input);
 
@@ -226,6 +499,20 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> batch_norm_backward_impl(
 {
     at::ScalarType dtype = input.scalar_type();
     at::ScalarType compute = is_low_prec(dtype) ? at::kFloat : dtype;
+
+    // fused fast path (A4, experiments/training_speedup.md): native partials /
+    // finalize / apply kernels; everything else stays on the aten composition
+    if (bn_fused_supported(input, weight, at::Tensor())
+        && grad_out.scalar_type() == dtype && grad_out.sizes() == input.sizes() && grad_out.is_contiguous()
+        && (train ? (save_mean.defined() && save_invstd.defined() && save_mean.scalar_type() == at::kFloat
+                     && save_invstd.scalar_type() == at::kFloat)
+                  : (running_mean.defined() && running_var.defined())))
+    {
+        at::Tensor mean32 = train ? save_mean : running_mean.to(at::kFloat);
+        at::Tensor rstd32 = train ? save_invstd : at::rsqrt(at::add(running_var.to(at::kFloat), eps));
+        return batch_norm_backward_fused(grad_out, input, weight, mean32, rstd32, train, output_mask);
+    }
+
     at::Tensor x = input.to(compute);
     at::Tensor dy = grad_out.to(compute);
     std::vector<int64_t> dims = batch_norm_dims(input);

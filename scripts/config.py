@@ -140,6 +140,21 @@ KERNELS = [
     Kernel('reduce_tree', 'ops/reduce_tree.slang', [
         Entry('reduce_tree_main', [F16, F32]),
     ]),
+    # fused native batch_norm train fwd / backward (A4, training_speedup.md):
+    # three kernels per call instead of the 15-20-kernel aten composition.
+    # bn_partials: per (channel, chunk) fp32 (sum, sumsq) [fwd] or
+    # (sum_dy, sum_dy*xhat) [backward]; bn_finalize: per-channel fold -> mean/
+    # rstd/saves/running stats [fwd, T = running dtype] or grad_bias/grad_weight
+    # [backward, T = parameter dtype]; bn_apply: normalization / grad_input.
+    Kernel('bn_partials', 'ops/batch_norm.slang', [
+        Entry('bn_partials_main', [F16, F32]),
+    ]),
+    Kernel('bn_finalize', 'ops/batch_norm.slang', [
+        Entry('bn_finalize_main', [F16, F32]),
+    ]),
+    Kernel('bn_apply', 'ops/batch_norm.slang', [
+        Entry('bn_apply_main', [F16, F32]),
+    ]),
     Kernel('scan', 'ops/scan.slang', [
         Entry('scan_main', DTYPES),
     ]),
