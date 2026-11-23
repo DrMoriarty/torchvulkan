@@ -29,6 +29,11 @@ TORCH_LIBRARY(torchvulkan, m) {
     // кернелу на q+k; autograd-пара lives in torchvulkan/fused_train.py
     m.def("rope_train_fwd(Tensor q, Tensor k, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
     m.def("rope_train_bwd(Tensor grad_q, Tensor grad_k, Tensor cos, Tensor sin) -> (Tensor, Tensor)");
+    // train-path fused depthwise causal conv1d of the LFM2 short-conv layers
+    // (ops/dwconv.cpp): fwd consumes the in_proj output [B, T, 3C] in place;
+    // the autograd pair lives in torchvulkan/fused_train.py
+    m.def("dwconv_train_fwd(Tensor proj, Tensor w, Tensor? bias=None, int activation=0) -> (Tensor, Tensor)");
+    m.def("dwconv_train_bwd(Tensor grad_out, Tensor proj, Tensor w, Tensor cache, int activation=0, bool with_bias=False) -> (Tensor, Tensor, Tensor)");
     m.def("rms_rope(Tensor x, Tensor cos, Tensor sin, Tensor w, float eps) -> Tensor");
     m.def("attn_decode(Tensor q, Tensor k_cache, Tensor v_cache, int cur, Tensor? k_cur=None, Tensor? v_cur=None, Tensor? qkn_w=None, Tensor? cos=None, Tensor? sin=None, float? eps=None) -> Tensor");
     m.def("silu_mul(Tensor g, Tensor u) -> Tensor");
@@ -52,6 +57,8 @@ TORCH_LIBRARY_IMPL(torchvulkan, PrivateUse1, m) {
     m.impl("rope_rotate_half", &torchvulkan::rope_rotate_half);
     m.impl("rope_train_fwd", &torchvulkan::rope_train_fwd);
     m.impl("rope_train_bwd", &torchvulkan::rope_train_bwd);
+    m.impl("dwconv_train_fwd", &torchvulkan::dwconv_train_fwd);
+    m.impl("dwconv_train_bwd", &torchvulkan::dwconv_train_bwd);
     m.impl("rms_rope", &torchvulkan::rms_rope);
     m.impl("attn_decode", &torchvulkan::attn_decode);
     m.impl("silu_mul", &torchvulkan::silu_mul_vulkan);

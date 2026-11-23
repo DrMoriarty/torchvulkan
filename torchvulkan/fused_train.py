@@ -20,6 +20,8 @@ _ce_fwd_op = torch.ops.torchvulkan.ce_fwd
 _ce_bwd_op = torch.ops.torchvulkan.ce_bwd
 _rope_fwd_op = torch.ops.torchvulkan.rope_train_fwd
 _rope_bwd_op = torch.ops.torchvulkan.rope_train_bwd
+_dwconv_fwd_op = torch.ops.torchvulkan.dwconv_train_fwd
+_dwconv_bwd_op = torch.ops.torchvulkan.dwconv_train_bwd
 
 
 class _FusedRMSNorm(torch.autograd.Function):
@@ -244,5 +246,125 @@ def unpatch_apply_rotary_pos_emb(module_names=_ROTARY_MODULE_NAMES) -> int:
         fn = getattr(mod, "apply_rotary_pos_emb", None)
         if fn is not None and hasattr(fn, _PATCH_ATTR):
             mod.apply_rotary_pos_emb = getattr(fn, _PATCH_ATTR)
+            restored += 1
+    return restored
+
+
+class _FusedCausalConv(torch.autograd.Function):
+    """Fused train-path depthwise causal conv1d of the LFM2 short-conv layer
+    body (1 dispatch fwd + 3 bwd instead of the ~6-10-dispatch eager chain per
+    phase, no transposed copies of [B, C, T]).
+
+    forward:  proj = in_proj(h)               [B, T, 3C] contiguous, chunks
+                                              [gate B | mix C | x]
+              out = C * act(depthwise_causal_conv(B * x, w, bias))
+              (conv output rounded and cached for the backward)
+    backward: grad of the three proj chunks (one kernel), grad_w/grad_bias via
+              fp32 per-batch partials + one aten sum.
+
+    grad wrt w/bias follows the same math as autograd through the eager chain
+    (F.conv1d(padding=k-1, groups=C) sliced to T); see dwconv_train.slang for
+    the replicated fp16 roundings.
+    """
+
+    @staticmethod
+    def forward(ctx, proj, w, bias, act):
+        out, cache = _dwconv_fwd_op(proj, w, bias, act)
+        ctx.save_for_backward(proj, w, cache)
+        ctx.act = act
+        ctx.has_bias = bias is not None
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        proj, w, cache = ctx.saved_tensors
+        gp, gw, gb = _dwconv_bwd_op(grad_out, proj, w, cache, ctx.act, ctx.has_bias)
+        return gp, gw, gb if ctx.has_bias else None, None
+
+
+def causal_conv_gate_train(proj: torch.Tensor, w: torch.Tensor, bias: torch.Tensor = None,
+                           activation: str = None) -> torch.Tensor:
+    """Fused train-path short-conv body: out = C * act(dw_causal_conv(B * x)).
+
+    proj: (B, T, 3C) contiguous fp16/fp32 vulkan tensor — the in_proj output
+    with chunks [gate B | mix C | x] along the last dim; w: (C, k) contiguous
+    (nn.Conv1d(groups=C).weight.squeeze(1)); bias: (C,)?; activation: None or
+    'silu' (LFM2 trains with none). The conv output is cached for backward.
+    """
+    act = 1 if activation == "silu" else 0
+    if activation is not None and act == 0:
+        raise ValueError(f"unsupported activation {activation!r} for the fused causal conv")
+    return _FusedCausalConv.apply(proj, w, bias, act)
+
+
+_SHORTCONV_CLASS_NAMES = ("Lfm2ShortConv",)
+_SHORTCONV_PATCH_ATTR = "_torchvulkan_fused_conv_orig"
+
+
+def patch_lfm2_shortconv(model: torch.nn.Module) -> int:
+    """Replace the forward of Lfm2ShortConv modules with the fused train kernel.
+
+    The fused path fires for vulkan fp16/fp32 inputs with no PREVIOUS conv
+    state (past_key_values is None or a fresh cache — the training-prefill
+    case; the fresh DynamicCache the model creates per forward is fine, the
+    last-k conv-state tail is updated from the proj chunks without the [B, C,
+    T] transpose). Everything else — single-token cached decode
+    (causal_conv1d_update), cache continuation with left context, recorded
+    past (rollback) — falls back to the original forward. Returns the number
+    of patched modules. Idempotent.
+    """
+    patched = 0
+    for module in model.modules():
+        if type(module).__name__ not in _SHORTCONV_CLASS_NAMES or not hasattr(module, "conv"):
+            continue
+        if hasattr(module, _SHORTCONV_PATCH_ATTR):
+            continue
+        orig = module.forward
+
+        def make_forward(mod, orig):
+            def forward(hidden_states, past_key_values=None, attention_mask=None, **kwargs):
+                conv_state = None
+                if past_key_values is not None:
+                    conv_state = past_key_values.get_conv_state(mod.layer_idx, state_idx=0)
+                if (conv_state is None
+                        and (past_key_values is None or not past_key_values.is_recording_past(mod.layer_idx))
+                        and hidden_states.dim() == 3
+                        and hidden_states.device.type == "vulkan"
+                        and hidden_states.dtype in (torch.float16, torch.float32)):
+                    if attention_mask is not None:
+                        dtype = hidden_states.dtype
+                        hidden_states = (hidden_states * attention_mask[:, :, None]).to(dtype)
+                    proj = mod.in_proj(hidden_states)
+                    out = _FusedCausalConv.apply(
+                        proj, mod.conv.weight.squeeze(1), mod.conv.bias, 0)
+                    if past_key_values is not None:
+                        # conv-state bookkeeping of the original forward: the
+                        # state keeps the last k columns of m = B*x — computed
+                        # here from the proj chunks as a small [B, C, k] copy
+                        ksz = mod.conv_kernel_size
+                        c = proj.shape[-1] // 3
+                        m_tail = (proj[:, -ksz:, :c] * proj[:, -ksz:, 2 * c:]).transpose(1, 2)
+                        if hidden_states.shape[1] < ksz:
+                            m_tail = torch.nn.functional.pad(m_tail, (ksz - hidden_states.shape[1], 0))
+                        past_key_values.update_conv_state(m_tail, mod.layer_idx, conv_kernel_size=ksz)
+                    return mod.out_proj(out)
+                return orig(hidden_states, past_key_values, attention_mask, **kwargs)
+
+            return forward
+
+        module.forward = make_forward(module, orig)
+        setattr(module, _SHORTCONV_PATCH_ATTR, orig)
+        patched += 1
+    return patched
+
+
+def unpatch_lfm2_shortconv(model: torch.nn.Module) -> int:
+    """Restore the original Lfm2ShortConv.forward (inverse of the patcher)."""
+    restored = 0
+    for module in model.modules():
+        orig = getattr(module, _SHORTCONV_PATCH_ATTR, None)
+        if orig is not None:
+            module.forward = orig
+            delattr(module, _SHORTCONV_PATCH_ATTR)
             restored += 1
     return restored

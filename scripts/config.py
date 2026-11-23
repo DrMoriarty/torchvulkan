@@ -373,4 +373,18 @@ KERNELS = [
     Kernel('rope_train_bwd', 'ops/rope_train.slang', [
         Entry('rope_train_bwd_main', [F16, F32]),
     ]),
+    # fused train-path depthwise causal conv1d of the LFM2 short-conv layers
+    # (experiments/lfm2_train_profile.md приоритет 4): fwd — 1 кернел поверх
+    # in_proj-выхода [B, T, 3C] (gate*B*x -> conv -> *C без транспон/копий);
+    # backward — кернел grad по трём чанкам proj + кернел wgrad-партиалов
+    # (свёртка по batch — aten sum). WG — compile-time константа (256)
+    Kernel('dwconv_train_fwd', 'ops/dwconv_train.slang', [
+        Entry('dwconv_fwd_main', [F16, F32], (), constants=(256,)),
+    ]),
+    Kernel('dwconv_train_bwd', 'ops/dwconv_train.slang', [
+        Entry('dwconv_bwd_main', [F16, F32], (), constants=(256,)),
+    ]),
+    Kernel('dwconv_wgrad', 'ops/dwconv_train.slang', [
+        Entry('dwconv_wgrad_main', [F16, F32], (), constants=(256,)),
+    ]),
 ]

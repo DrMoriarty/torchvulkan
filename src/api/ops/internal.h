@@ -67,6 +67,13 @@ std::tuple<at::Tensor, at::Tensor> rope_train_fwd(const at::Tensor& q, const at:
     const at::Tensor& cos_t, const at::Tensor& sin_t);
 std::tuple<at::Tensor, at::Tensor> rope_train_bwd(const at::Tensor& grad_q, const at::Tensor& grad_k,
     const at::Tensor& cos_t, const at::Tensor& sin_t);
+// ops/dwconv.cpp — fused train-path depthwise causal conv1d of the LFM2
+// short-conv layers (gate*x -> conv -> *C over the [B, T, 3C] in_proj output,
+// no transposes); autograd-пара lives in torchvulkan/fused_train.py
+std::tuple<at::Tensor, at::Tensor> dwconv_train_fwd(const at::Tensor& proj, const at::Tensor& w,
+    const c10::optional<at::Tensor>& bias, int64_t act);
+std::tuple<at::Tensor, at::Tensor, at::Tensor> dwconv_train_bwd(const at::Tensor& grad_out,
+    const at::Tensor& proj, const at::Tensor& w, const at::Tensor& cache, int64_t act, bool with_bias);
 at::Tensor rms_rope(const at::Tensor& x, const at::Tensor& cos_t, const at::Tensor& sin_t,
     const at::Tensor& w, double eps);
 at::Tensor attn_decode(const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache, int64_t cur,
