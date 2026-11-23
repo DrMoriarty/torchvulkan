@@ -1,4 +1,8 @@
 #include <torch/extension.h>
+#include <cstring>
+#include <mutex>
+#include <unordered_map>
+#include <vector>
 #include "vulkan/memory.h"
 #include "vulkan/vulkan_context.h"
 #include "vulkan/allocator.h"
@@ -39,6 +43,39 @@ constexpr float kNF4Codebook[16] = {
 
 // k-values one lane covers per aligned iteration (one 32-bit weight load)
 uint32_t gemv_per_lane(int fmt) { return fmt == QUANT_FMT_INT8 ? 4 : 8; }
+
+// the NF4 dequant table as a tiny device buffer, cached per device: the GEMV
+// kernel fetches dequant values with L1-resident indexed loads (a WaveReadLaneAt
+// shuffle per nibble measured ~1.44x int4 GEMV time on the 5300M — the readlane
+// burns ALU slots; a per-nibble buffer load ~1.26x; the byte-pair table below
+// closes on int4). Entry b holds both codes of the weight byte b as ready fp32
+// values: uint2 = (code of the low nibble = even k, code of the high nibble).
+at::Tensor nf4_lut_buffer(DeviceContext* device, const at::TensorOptions& options)
+{
+    static std::mutex mu;
+    static std::unordered_map<DeviceContext*, at::Tensor> cache;
+    std::lock_guard<std::mutex> lock(mu);
+    auto it = cache.find(device);
+    if (it != cache.end()) return it->second;
+
+    uint32_t bits[16];
+    for (int i = 0; i < 16; i++)
+    {
+        float f = kNF4Codebook[i];
+        std::memcpy(&bits[i], &f, 4);
+    }
+    std::vector<int64_t> table(256);
+    for (int b = 0; b < 256; b++)
+        table[b] = static_cast<int64_t>(
+            static_cast<uint64_t>(bits[b & 15]) |
+            (static_cast<uint64_t>(bits[b >> 4]) << 32));
+
+    at::Tensor lut = at::empty({256}, options.dtype(at::kLong)).copy_(
+        at::tensor(at::ArrayRef<int64_t>(table.data(), 256),
+                   at::TensorOptions().dtype(at::kLong)));
+    cache.emplace(device, lut);
+    return lut;
+}
 
 at::Tensor dequantize_packed(
     const at::Tensor& w_packed,
@@ -152,6 +189,13 @@ at::Tensor dispatch_quant_gemv(
     const uint32_t row_stride = static_cast<uint32_t>(w_packed.stride(0)); // bytes: uint8 rows
 
     auto aligned_16b = [](const at::Tensor& t) { return get_tensor_address(t) % 16 == 0; };
+    // NF4 dequantizes through a cached byte-pair codebook table in device memory
+    at::Tensor nf4_lut;
+    if (fmt == QUANT_FMT_NF4)
+    {
+        nf4_lut = nf4_lut_buffer(device, x.options());
+        materialize_cow(nf4_lut);
+    }
     materialize_cow(x);
     materialize_cow(w_packed);
     materialize_cow(scales);
@@ -193,6 +237,7 @@ at::Tensor dispatch_quant_gemv(
     pcs.push(x2.has_value() ? get_tensor_address(*x2) : (uint64_t)0);
     pcs.push(acc.has_value() ? 1u : 0u);
     pcs.push(x2.has_value() ? 1u : 0u);
+    pcs.push(fmt == QUANT_FMT_NF4 ? get_tensor_address(nf4_lut) : (uint64_t)0);
 
     std::vector<at::Tensor> readTensors = {x, w_packed, scales};
     if (zeros.has_value()) readTensors.push_back(*zeros);
@@ -200,6 +245,7 @@ at::Tensor dispatch_quant_gemv(
     if (rms_w.has_value()) readTensors.push_back(*rms_w);
     if (acc.has_value()) readTensors.push_back(*acc);
     if (x2.has_value()) readTensors.push_back(*x2);
+    if (fmt == QUANT_FMT_NF4) readTensors.push_back(nf4_lut);
 
     const torchvulkan::Kernel kernel = fmt == QUANT_FMT_INT4 ? torchvulkan::Kernel::QUANT_GEMV_W4
                                      : fmt == QUANT_FMT_NF4 ? torchvulkan::Kernel::QUANT_GEMV_NF4

@@ -31,10 +31,13 @@ __exported import core.dtype;
 
 // NF4 codebook: 16 quantiles of the standard normal distribution (QLoRA,
 // Dettmers et al. 2023 — the published bitsandbytes constants), |max| normalized
-// to 1, strictly ascending, index 7 is exactly 0.0. Indexed dynamically by the
-// nibble (a 15-select ALU decode tree measured ~1.46x int4 GEMV time vs ~1.26x
-// for this constant-array form on the 5300M — the L1 loads hide better than the
-// serial select chain).
+// to 1, strictly ascending, index 7 is exactly 0.0. The aligned path dequantizes
+// through a byte-pair table in device memory (tensor_lut push constant, built
+// and cached per device on the host, see quant.cpp); this static array serves
+// the fallback path. Alternatives measured worse on the 5300M: a per-nibble
+// WaveReadLaneAt shuffle ~1.44x int4 GEMV time (the readlane eats ~half the ALU
+// bandwidth and pulls the kernel out of memory-bound), a 15-select decode tree
+// ~1.46x, a per-nibble device-buffer load ~1.26x.
 static const float NF4_LUT[16] = {
     -1.0,    -0.6962, -0.5251, -0.3949, -0.2844, -0.1848, -0.0911,  0.0,
      0.0796,  0.1609,  0.2461,  0.3379,  0.4407,  0.5626,  0.7230,  1.0
@@ -75,6 +78,7 @@ public struct QuantGemvPushConstants
     public uint64_t tensor_x2;     // (B, K), T: SwiGLU-пара u; акт = silu(x)*u
     public uint acc_flag;          // 1: out = acc + GEMV result
     public uint x2_flag;           // 1: активации = silu(x[k]) * x2[k] (down-proj SwiGLU)
+    public uint64_t tensor_lut;    // (256,) uint64, NF4 byte-pair dequant table, 0 = absent
 }
 
 [shader("compute")]
@@ -99,6 +103,10 @@ void quant_gemv_main<T : ITorchVulkan, let PACK : int>(
     T* bias = (T*)pcs.tensor_bias;
     T* acc_in = (T*)pcs.tensor_acc;
     T* x2 = (T*)pcs.tensor_x2;
+    // NF4 dequant table: entry per weight byte, uint2 = (code of the low nibble,
+    // code of the high nibble) as ready fp32 values — one L1-resident u64 load
+    // per byte, zero unpack ALU
+    uint2* lut2 = (uint2*)pcs.tensor_lut;
 
     uint group = pcs.K / pcs.ngroups; // ngroups == 1 -> group == K, k/group == 0
 
@@ -110,19 +118,7 @@ void quant_gemv_main<T : ITorchVulkan, let PACK : int>(
         uint waves = WG / lanes; // output columns per workgroup
 
         uint n = wg.x * waves + wave;
-        // NF4 keeps every lane alive through the k-loop: each lane is a shuffle
-        // source for the codebook (WaveReadLaneAt below), so invalid tail columns
-        // clamp onto the last row instead of exiting — their reads stay in bounds
-        // and their results are discarded at the store. int8/int4 exit as before.
-        bool col_valid = true;
-        float lut_val = 0;
-        if (PACK == 2)
-        {
-            lut_val = NF4_LUT[WaveGetLaneIndex() & 15];
-            col_valid = n < pcs.N;
-            n = col_valid ? n : (pcs.N - 1);
-        }
-        else if (n >= pcs.N)
+        if (n >= pcs.N)
         {
             return;
         }
@@ -164,30 +160,65 @@ void quant_gemv_main<T : ITorchVulkan, let PACK : int>(
 
             // the whole per-lane chunk sits in one scale group
             float dot = 0;
-            [unroll]
-            for (uint j = 0; j < PER_LANE; j++)
+            if (PACK == 2)
             {
-                uint q = PACK == 8 ? ((wb >> (8 * j)) & 0xFF) : ((wb >> (4 * j)) & 0xF);
-                // dequantized weight factor: NF4 fetches the codebook entry with a
-                // subgroup shuffle (lanes 0..15 hold the LUT — one ALU op instead
-                // of a constant-memory load per element), int8/int4 shift the
-                // integer code by the zero point
-                float wv = (PACK == 2) ? WaveReadLaneAt(lut_val, q) : (float(q) - z);
-                float coef = rrms;
-                if (pcs.tensor_rms_w != 0)
-                    coef *= castValue<T, float>(rms_w[k + j]);
-                float av;
-                if (pcs.x2_flag == 1)
-                    av = silu_v(castValue<T, float>(x[k + j])) * castValue<T, float>(x2[uint64_t(b) * pcs.K + k + j]);
-                else
-                    av = castValue<T, float>(x[k + j]) * coef;
-                dot += wv * av;
+                // NF4: one u64 table load per weight byte, both dequantized codes
+                // ready in the uint2 (low nibble = even k -> .x, high -> .y). The
+                // 2 KB table stays hot in L1 and the load rides the LSU pipe —
+                // a per-nibble WaveReadLaneAt shuffle here measured ~1.44x int4
+                // GEMV time (readlane burns ALU slots), a per-nibble buffer load
+                // ~1.26x, this byte-pair form closes on int4.
+                [unroll]
+                for (uint jb = 0; jb < 4; jb++)
+                {
+                    uint bw = (wb >> (8 * jb)) & 0xFF;
+                    uint2 pair = lut2[bw];
+                    uint k0e = k + 2 * jb;
+                    float av0, av1;
+                    if (pcs.x2_flag == 1)
+                    {
+                        av0 = silu_v(castValue<T, float>(x[k0e])) * castValue<T, float>(x2[uint64_t(b) * pcs.K + k0e]);
+                        av1 = silu_v(castValue<T, float>(x[k0e + 1])) * castValue<T, float>(x2[uint64_t(b) * pcs.K + k0e + 1]);
+                    }
+                    else
+                    {
+                        float coef0 = rrms;
+                        float coef1 = rrms;
+                        if (pcs.tensor_rms_w != 0)
+                        {
+                            coef0 *= castValue<T, float>(rms_w[k0e]);
+                            coef1 *= castValue<T, float>(rms_w[k0e + 1]);
+                        }
+                        av0 = castValue<T, float>(x[k0e]) * coef0;
+                        av1 = castValue<T, float>(x[k0e + 1]) * coef1;
+                    }
+                    dot += asfloat(pair.x) * av0 + asfloat(pair.y) * av1;
+                }
+            }
+            else
+            {
+                [unroll]
+                for (uint j = 0; j < PER_LANE; j++)
+                {
+                    uint q = PACK == 8 ? ((wb >> (8 * j)) & 0xFF) : ((wb >> (4 * j)) & 0xF);
+                    // int8/int4 shift the integer code by the zero point
+                    float wv = (float(q) - z);
+                    float coef = rrms;
+                    if (pcs.tensor_rms_w != 0)
+                        coef *= castValue<T, float>(rms_w[k + j]);
+                    float av;
+                    if (pcs.x2_flag == 1)
+                        av = silu_v(castValue<T, float>(x[k + j])) * castValue<T, float>(x2[uint64_t(b) * pcs.K + k + j]);
+                    else
+                        av = castValue<T, float>(x[k + j]) * coef;
+                    dot += wv * av;
+                }
             }
             acc += dot * sc;
         }
         acc = WaveActiveSum(acc);
 
-        if (lane == 0 && col_valid)
+        if (lane == 0)
         {
             if (HAS_BIAS == 1) acc += castValue<T, float>(bias[n]);
             if (pcs.acc_flag == 1) acc += castValue<T, float>(acc_in[uint64_t(b) * pcs.N + n]);
