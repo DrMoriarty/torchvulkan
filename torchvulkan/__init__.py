@@ -87,12 +87,17 @@ def memory_stats(device=None) -> dict:
     index = _device_index(device)
     allocated = _C._memory_allocated(index)
     peak = _C._max_memory_allocated(index)
+    # Host-memory fallback counters are cumulative over ALL devices (see
+    # host_memory_fallback()), so they ignore the device index.
+    fb_count, fb_bytes = _C._host_memory_fallback_stats()
     return {
         "active_bytes.all.current": allocated,
         "active_bytes.all.peak": peak,
         "allocated_bytes.all.current": allocated,
         "allocated_bytes.all.peak": peak,
         "reserved_bytes.all.current": _C._memory_reserved(index),
+        "host_memory_fallback.count": fb_count,
+        "host_memory_fallback.bytes": fb_bytes,
     }
 
 def host_memory_fallback() -> dict:
