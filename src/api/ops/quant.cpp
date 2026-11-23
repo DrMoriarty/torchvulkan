@@ -230,7 +230,10 @@ at::Tensor weight_quant_mm(
         TORCH_CHECK(!x2_.has_value(), "torchvulkan [ERROR]: x2 fusion requires M == 1 activations.");
         at::Tensor deq = dequantize_packed(w_packed_c, scales_c, zeros, is_int4, K, x.scalar_type());
         at::Tensor x2d = x.reshape({-1, K});
-        return at::matmul(x2d, deq.t()).reshape(out_shape);
+        at::Tensor out = at::matmul(x2d, deq.t()).reshape(out_shape);
+        // the GEMV path folds the bias into the kernel; the GEMM path adds it here
+        if (bias.has_value()) out = out + *bias;
+        return out;
     }
 
     std::optional<at::Tensor> acc;
@@ -287,6 +290,38 @@ at::Tensor weight_int4_mm_vulkan(
     return weight_quant_mm(x, w_packed, scales, zeros, bias, /*is_int4=*/true, rms_eps, rms_w, acc, x2);
 }
 
+void check_dequant_args(
+    const at::Tensor& w_packed,
+    const at::Tensor& scales,
+    const std::optional<at::Tensor>& zeros,
+    bool is_int4,
+    int64_t K,
+    at::ScalarType out_dtype)
+{
+    TORCH_CHECK(w_packed.is_privateuseone() && w_packed.scalar_type() == at::kByte && w_packed.dim() == 2,
+        "torchvulkan [ERROR]: weight_dequant expects a 2D uint8 vulkan packed weight, got dtype ",
+        w_packed.dtype(), ", shape ", w_packed.sizes(), ".");
+    TORCH_CHECK(scales.is_privateuseone() && scales.scalar_type() == at::kFloat && scales.dim() == 2,
+        "torchvulkan [ERROR]: weight_dequant scales must be a 2D float32 vulkan tensor (N, ngroups), got dtype ",
+        scales.dtype(), ", shape ", scales.sizes(), ".");
+    const int64_t N = w_packed.size(0);
+    const int64_t ngroups = scales.size(1);
+    TORCH_CHECK(scales.size(0) == N, "torchvulkan [ERROR]: scales rows (", scales.size(0),
+        ") must match weight rows (", N, ").");
+    TORCH_CHECK(K > 0 && K % ngroups == 0,
+        "torchvulkan [ERROR]: K = ", K, " must be positive and divide into the ", ngroups, " scale groups.");
+    const int64_t k_capacity = w_packed.size(1) * (is_int4 ? 2 : 1);
+    TORCH_CHECK(K <= k_capacity,
+        "torchvulkan [ERROR]: K = ", K, " exceeds the packed capacity of ", k_capacity, " k-values.");
+    if (is_int4) {
+        TORCH_CHECK(zeros.has_value() && zeros->is_privateuseone() && zeros->scalar_type() == at::kFloat &&
+            zeros->dim() == 2 && zeros->sizes() == scales.sizes(),
+            "torchvulkan [ERROR]: int4 dequantization requires a zeros tensor with the same (N, ngroups) shape as scales.");
+    }
+    TORCH_CHECK(out_dtype == at::kHalf || out_dtype == at::kFloat,
+        "torchvulkan [ERROR]: weight_dequant out_dtype must be fp16 or fp32, got ", out_dtype, ".");
+}
+
 } // namespace
 
 // definitions live here so the registration in api/registration.cpp can bind them;
@@ -294,6 +329,20 @@ at::Tensor weight_int4_mm_vulkan(
 // _weight_int8pack_mm) and dispatched on PrivateUse1
 
 namespace torchvulkan {
+
+// host-side escape hatch over the internal dequantize_packed: the LoRA train
+// path (torchvulkan/lora.py) needs the dequantized fp16/fp32 weight for
+// grad_x = grad_out @ deq(W) — either to materialize a per-layer backward
+// cache or to recompute it transiently. Same kernel semantics as the M>1 path
+// of weight_int*_mm (the composite is identical aten ops on vulkan).
+at::Tensor weight_dequant(const at::Tensor& w_packed_, const at::Tensor& scales_,
+    const std::optional<at::Tensor>& zeros_, bool is_int4, int64_t K, at::ScalarType out_dtype)
+{
+    check_dequant_args(w_packed_, scales_, zeros_, is_int4, K, out_dtype);
+    return dequantize_packed(w_packed_.contiguous(), scales_.contiguous(),
+        zeros_.has_value() ? std::optional<at::Tensor>(zeros_->contiguous()) : std::nullopt,
+        is_int4, K, out_dtype);
+}
 
 at::Tensor weight_int8_mm(const at::Tensor& x, const at::Tensor& w_packed, const at::Tensor& scales,
     const std::optional<at::Tensor>& bias, const std::optional<double>& rms_eps,

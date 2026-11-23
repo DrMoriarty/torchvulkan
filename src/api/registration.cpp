@@ -13,6 +13,10 @@ TORCH_LIBRARY_IMPL(_, AutocastPrivateUse1, m) {
 TORCH_LIBRARY(torchvulkan, m) {
     m.def("weight_int8_mm(Tensor x, Tensor w_packed, Tensor scales, Tensor? bias=None, float? rms_eps=None, Tensor? rms_w=None, Tensor? acc=None, Tensor? x2=None) -> Tensor");
     m.def("weight_int4_mm(Tensor x, Tensor w_packed, Tensor scales, Tensor zeros, Tensor? bias=None, float? rms_eps=None, Tensor? rms_w=None, Tensor? acc=None, Tensor? x2=None) -> Tensor");
+    // dequantize a packed weight-only matrix to fp16/fp32 (kernel semantics of
+    // the M>1 path of weight_int*_mm); the train path (lora.py) uses it for
+    // grad_x = grad_out @ deq(W) and optional per-layer dequant caches
+    m.def("weight_dequant(Tensor w_packed, Tensor scales, Tensor? zeros, bool is_int4, int K, ScalarType out_dtype) -> Tensor");
     m.def("rms_norm(Tensor x, Tensor w, float eps) -> Tensor");
     m.def("rms_norm_add(Tensor x1, Tensor x2, Tensor w, float eps) -> (Tensor, Tensor)");
     // train-path fused RMSNorm (ops/fused.cpp): fwd saves the per-row rrms,
@@ -48,6 +52,7 @@ TORCH_LIBRARY(torchvulkan, m) {
 TORCH_LIBRARY_IMPL(torchvulkan, PrivateUse1, m) {
     m.impl("weight_int8_mm", &torchvulkan::weight_int8_mm);
     m.impl("weight_int4_mm", &torchvulkan::weight_int4_mm);
+    m.impl("weight_dequant", &torchvulkan::weight_dequant);
     m.impl("rms_norm", &torchvulkan::rms_norm_fused);
     m.impl("rms_norm_add", &torchvulkan::rms_norm_add);
     m.impl("rms_norm_train_fwd", &torchvulkan::rms_norm_train_fwd);
