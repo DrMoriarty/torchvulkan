@@ -6,29 +6,45 @@
 
 // Weight-only quantized matmul, the torchvulkan analogue of ATen's
 // _weight_int8pack_mm / _weight_int4pack_mm. Activations fp16/fp32, weights
-// int8 (one byte per k, zero folded into the offset: value = (q - 128) * scale)
-// or int4 (two nibbles per byte, low nibble = even k: value = (q - 8) * scale),
+// int8 (one byte per k, zero folded into the offset: value = (q - 128) * scale),
+// int4 (two nibbles per byte, low nibble = even k: value = (q - zero) * scale)
+// or NF4 (the same nibble layout, the nibble is an index into the 16-entry
+// NormalFloat4 codebook of QLoRA: value = NF4_LUT[q] * absmax-scale),
 // accumulation fp32, output in the activation dtype. Rows may be padded (the
 // last dimension of w_packed may exceed K / 2 or K), padding is never read.
 //
 // M == 1 (decode) runs a dedicated GEMV kernel (src/shaders/ops/quant_gemv.slang)
 // that dequantizes in registers while streaming the weights: the weight bytes
-// are the only real traffic, so int4 decodes at roughly half the fp16 weight
-// bandwidth and int8 at ~2/3 of it. Larger M dequantizes to the activation
-// dtype and runs the regular fp GEMM (prefill is compute-bound anyway).
+// are the only real traffic, so the 4-bit formats decode at roughly half the
+// fp16 weight bandwidth and int8 at ~2/3 of it. Larger M dequantizes to the
+// activation dtype and runs the regular fp GEMM (prefill is compute-bound anyway).
 
 namespace {
 
 constexpr uint32_t GEMV_WG = 128;
 
+// weight-only formats: the `format` argument of weight_dequant; the dedicated
+// weight_*_mm ops fix it per op (int8 = 0, int4 = 1, nf4 = 2)
+constexpr int QUANT_FMT_INT8 = 0;
+constexpr int QUANT_FMT_INT4 = 1;
+constexpr int QUANT_FMT_NF4 = 2;
+
+// NormalFloat4 codebook (QLoRA, Dettmers et al. 2023 — the published bitsandbytes
+// constants); 16 quantiles of the standard normal distribution, |max| normalized
+// to 1, strictly ascending, index 7 is exactly 0.0
+constexpr float kNF4Codebook[16] = {
+    -1.0f,    -0.6962f, -0.5251f, -0.3949f, -0.2844f, -0.1848f, -0.0911f,  0.0f,
+     0.0796f,  0.1609f,  0.2461f,  0.3379f,  0.4407f,  0.5626f,  0.7230f,  1.0f
+};
+
 // k-values one lane covers per aligned iteration (one 32-bit weight load)
-uint32_t gemv_per_lane(bool is_int4) { return is_int4 ? 8 : 4; }
+uint32_t gemv_per_lane(int fmt) { return fmt == QUANT_FMT_INT8 ? 4 : 8; }
 
 at::Tensor dequantize_packed(
     const at::Tensor& w_packed,
     const at::Tensor& scales,
     const std::optional<at::Tensor>& zeros,
-    bool is_int4,
+    int fmt,
     int64_t K,
     at::ScalarType out_dtype)
 {
@@ -39,18 +55,26 @@ at::Tensor dequantize_packed(
 
     at::Tensor w = w_packed.to(at::kInt);
     at::Tensor vals;
-    if (is_int4) {
+    if (fmt == QUANT_FMT_INT8) {
+        vals = at::sub(w, 128).narrow(1, 0, K);
+    } else {
         at::Tensor lo = at::bitwise_and(w, 0xF);
         at::Tensor hi = at::bitwise_and(at::bitwise_right_shift(w, 4), 0xF);
         // byte j of the row holds k = 2*j (low nibble) and k = 2*j + 1 (high nibble)
-        vals = at::stack({lo, hi}, -1).reshape({N, row_bytes * 2}).narrow(1, 0, K);
-    } else {
-        vals = at::sub(w, 128).narrow(1, 0, K);
+        at::Tensor q = at::stack({lo, hi}, -1).reshape({N, row_bytes * 2}).narrow(1, 0, K);
+        if (fmt == QUANT_FMT_NF4) {
+            // the nibble is a codebook index: value = NF4_LUT[q] * scale
+            at::Tensor lut = at::tensor(at::ArrayRef<float>(kNF4Codebook, 16),
+                w_packed.options().dtype(at::kFloat));
+            vals = lut.index_select(0, q.reshape(-1)).view({N, K});
+        } else {
+            vals = q;
+        }
     }
 
     // per-group scales (and int4 zero points): (N, ngroups) -> broadcast over k
     at::Tensor centered = vals.view({N, ngroups, group});
-    if (is_int4) centered = centered - zeros->unsqueeze(-1);
+    if (fmt == QUANT_FMT_INT4) centered = centered - zeros->unsqueeze(-1);
     at::Tensor deq = centered * scales.unsqueeze(-1);
     return deq.view({N, K}).to(out_dtype).contiguous();
 }
@@ -61,9 +85,11 @@ void check_quant_args(
     const at::Tensor& scales,
     const std::optional<at::Tensor>& zeros,
     const std::optional<at::Tensor>& bias,
-    bool is_int4)
+    int fmt)
 {
-    TORCH_CHECK(x.is_privateuseone(), "torchvulkan [ERROR]: weight_int*_mm expects vulkan activations, got ", x.device(), ".");
+    TORCH_CHECK(fmt >= QUANT_FMT_INT8 && fmt <= QUANT_FMT_NF4,
+        "torchvulkan [ERROR]: unknown weight-only quant format ", fmt, ".");
+    TORCH_CHECK(x.is_privateuseone(), "torchvulkan [ERROR]: weight_*_mm expects vulkan activations, got ", x.device(), ".");
     TORCH_CHECK(w_packed.is_privateuseone() && w_packed.scalar_type() == at::kByte && w_packed.dim() == 2,
         "torchvulkan [ERROR]: packed weights must be a 2D uint8 vulkan tensor, got dtype ", w_packed.dtype(),
         ", shape ", w_packed.sizes(), ".");
@@ -78,7 +104,7 @@ void check_quant_args(
     TORCH_CHECK(scales.size(0) == N, "torchvulkan [ERROR]: scales rows (", scales.size(0), ") must match weight rows (", N, ").");
     TORCH_CHECK(K % scales.size(1) == 0,
         "torchvulkan [ERROR]: K = ", K, " must divide into the ", scales.size(1), " scale groups along k.");
-    if (is_int4) {
+    if (fmt == QUANT_FMT_INT4) {
         TORCH_CHECK(zeros.has_value() && zeros->is_privateuseone() && zeros->scalar_type() == at::kFloat &&
             zeros->dim() == 2 && zeros->sizes() == scales.sizes(),
             "torchvulkan [ERROR]: int4 requires a zeros tensor with the same (N, ngroups) shape as scales.");
@@ -97,7 +123,7 @@ at::Tensor dispatch_quant_gemv(
     const at::Tensor& scales,
     const std::optional<at::Tensor>& zeros,
     const std::optional<at::Tensor>& bias,
-    bool is_int4,
+    int fmt,
     const std::optional<double>& rms_eps,
     const std::optional<at::Tensor>& rms_w,
     const std::optional<at::Tensor>& acc,
@@ -121,7 +147,7 @@ at::Tensor dispatch_quant_gemv(
         "torchvulkan [ERROR]: quantized GEMV batch ", B, " exceeds the device's workgroup count limit.");
 
     const uint32_t lanes = device->default_subgroup_size;
-    const uint32_t per_lane = gemv_per_lane(is_int4);
+    const uint32_t per_lane = gemv_per_lane(fmt);
     const uint32_t step = lanes * per_lane;
     const uint32_t row_stride = static_cast<uint32_t>(w_packed.stride(0)); // bytes: uint8 rows
 
@@ -175,7 +201,9 @@ at::Tensor dispatch_quant_gemv(
     if (acc.has_value()) readTensors.push_back(*acc);
     if (x2.has_value()) readTensors.push_back(*x2);
 
-    const torchvulkan::Kernel kernel = is_int4 ? torchvulkan::Kernel::QUANT_GEMV_W4 : torchvulkan::Kernel::QUANT_GEMV_W8;
+    const torchvulkan::Kernel kernel = fmt == QUANT_FMT_INT4 ? torchvulkan::Kernel::QUANT_GEMV_W4
+                                     : fmt == QUANT_FMT_NF4 ? torchvulkan::Kernel::QUANT_GEMV_NF4
+                                     : torchvulkan::Kernel::QUANT_GEMV_W8;
     // aligned path: each subgroup computes one output column
     const uint32_t columns_per_wg = isAligned ? GEMV_WG / std::max(lanes, (uint32_t)1) : GEMV_WG;
 
@@ -198,13 +226,13 @@ at::Tensor weight_quant_mm(
     const at::Tensor& scales,
     const std::optional<at::Tensor>& zeros_,
     const std::optional<at::Tensor>& bias_,
-    bool is_int4,
+    int fmt,
     const std::optional<double>& rms_eps_,
     const std::optional<at::Tensor>& rms_w_,
     const std::optional<at::Tensor>& acc_,
     const std::optional<at::Tensor>& x2_)
 {
-    check_quant_args(x_, w_packed, scales, zeros_, bias_, is_int4);
+    check_quant_args(x_, w_packed, scales, zeros_, bias_, fmt);
 
     at::Tensor x = x_.contiguous();
     at::Tensor w_packed_c = w_packed.contiguous();
@@ -228,7 +256,7 @@ at::Tensor weight_quant_mm(
         TORCH_CHECK(!rms_eps_.has_value(), "torchvulkan [ERROR]: rms_eps fusion requires M == 1 activations.");
         TORCH_CHECK(!acc_.has_value(), "torchvulkan [ERROR]: acc fusion requires M == 1 activations.");
         TORCH_CHECK(!x2_.has_value(), "torchvulkan [ERROR]: x2 fusion requires M == 1 activations.");
-        at::Tensor deq = dequantize_packed(w_packed_c, scales_c, zeros, is_int4, K, x.scalar_type());
+        at::Tensor deq = dequantize_packed(w_packed_c, scales_c, zeros, fmt, K, x.scalar_type());
         at::Tensor x2d = x.reshape({-1, K});
         at::Tensor out = at::matmul(x2d, deq.t()).reshape(out_shape);
         // the GEMV path folds the bias into the kernel; the GEMM path adds it here
@@ -259,7 +287,7 @@ at::Tensor weight_quant_mm(
         x2 = x2_->contiguous();
     }
 
-    at::Tensor result = dispatch_quant_gemv(x, w_packed_c, scales_c, zeros, bias, is_int4, rms_eps_, rms_w_, acc, x2_);
+    at::Tensor result = dispatch_quant_gemv(x, w_packed_c, scales_c, zeros, bias, fmt, rms_eps_, rms_w_, acc, x2_);
     return result.reshape(out_shape);
 }
 
@@ -273,7 +301,7 @@ at::Tensor weight_int8_mm_vulkan(
     const std::optional<at::Tensor>& acc,
     const std::optional<at::Tensor>& x2)
 {
-    return weight_quant_mm(x, w_packed, scales, std::nullopt, bias, /*is_int4=*/false, rms_eps, rms_w, acc, x2);
+    return weight_quant_mm(x, w_packed, scales, std::nullopt, bias, QUANT_FMT_INT8, rms_eps, rms_w, acc, x2);
 }
 
 at::Tensor weight_int4_mm_vulkan(
@@ -287,17 +315,32 @@ at::Tensor weight_int4_mm_vulkan(
     const std::optional<at::Tensor>& acc,
     const std::optional<at::Tensor>& x2)
 {
-    return weight_quant_mm(x, w_packed, scales, zeros, bias, /*is_int4=*/true, rms_eps, rms_w, acc, x2);
+    return weight_quant_mm(x, w_packed, scales, zeros, bias, QUANT_FMT_INT4, rms_eps, rms_w, acc, x2);
+}
+
+at::Tensor weight_nf4_mm_vulkan(
+    const at::Tensor& x,
+    const at::Tensor& w_packed,
+    const at::Tensor& scales,
+    const std::optional<at::Tensor>& bias,
+    const std::optional<double>& rms_eps,
+    const std::optional<at::Tensor>& rms_w,
+    const std::optional<at::Tensor>& acc,
+    const std::optional<at::Tensor>& x2)
+{
+    return weight_quant_mm(x, w_packed, scales, std::nullopt, bias, QUANT_FMT_NF4, rms_eps, rms_w, acc, x2);
 }
 
 void check_dequant_args(
     const at::Tensor& w_packed,
     const at::Tensor& scales,
     const std::optional<at::Tensor>& zeros,
-    bool is_int4,
+    int fmt,
     int64_t K,
     at::ScalarType out_dtype)
 {
+    TORCH_CHECK(fmt >= QUANT_FMT_INT8 && fmt <= QUANT_FMT_NF4,
+        "torchvulkan [ERROR]: unknown weight-only quant format ", fmt, ".");
     TORCH_CHECK(w_packed.is_privateuseone() && w_packed.scalar_type() == at::kByte && w_packed.dim() == 2,
         "torchvulkan [ERROR]: weight_dequant expects a 2D uint8 vulkan packed weight, got dtype ",
         w_packed.dtype(), ", shape ", w_packed.sizes(), ".");
@@ -310,10 +353,10 @@ void check_dequant_args(
         ") must match weight rows (", N, ").");
     TORCH_CHECK(K > 0 && K % ngroups == 0,
         "torchvulkan [ERROR]: K = ", K, " must be positive and divide into the ", ngroups, " scale groups.");
-    const int64_t k_capacity = w_packed.size(1) * (is_int4 ? 2 : 1);
+    const int64_t k_capacity = w_packed.size(1) * (fmt == QUANT_FMT_INT8 ? 1 : 2);
     TORCH_CHECK(K <= k_capacity,
         "torchvulkan [ERROR]: K = ", K, " exceeds the packed capacity of ", k_capacity, " k-values.");
-    if (is_int4) {
+    if (fmt == QUANT_FMT_INT4) {
         TORCH_CHECK(zeros.has_value() && zeros->is_privateuseone() && zeros->scalar_type() == at::kFloat &&
             zeros->dim() == 2 && zeros->sizes() == scales.sizes(),
             "torchvulkan [ERROR]: int4 dequantization requires a zeros tensor with the same (N, ngroups) shape as scales.");
@@ -334,14 +377,16 @@ namespace torchvulkan {
 // path (torchvulkan/lora.py) needs the dequantized fp16/fp32 weight for
 // grad_x = grad_out @ deq(W) — either to materialize a per-layer backward
 // cache or to recompute it transiently. Same kernel semantics as the M>1 path
-// of weight_int*_mm (the composite is identical aten ops on vulkan).
+// of weight_*_mm (the composite is identical aten ops on vulkan).
+// `format`: 0 = int8, 1 = int4, 2 = nf4 (legacy bool callers pass 0/1).
 at::Tensor weight_dequant(const at::Tensor& w_packed_, const at::Tensor& scales_,
-    const std::optional<at::Tensor>& zeros_, bool is_int4, int64_t K, at::ScalarType out_dtype)
+    const std::optional<at::Tensor>& zeros_, int64_t format, int64_t K, at::ScalarType out_dtype)
 {
-    check_dequant_args(w_packed_, scales_, zeros_, is_int4, K, out_dtype);
+    const int fmt = static_cast<int>(format);
+    check_dequant_args(w_packed_, scales_, zeros_, fmt, K, out_dtype);
     return dequantize_packed(w_packed_.contiguous(), scales_.contiguous(),
         zeros_.has_value() ? std::optional<at::Tensor>(zeros_->contiguous()) : std::nullopt,
-        is_int4, K, out_dtype);
+        fmt, K, out_dtype);
 }
 
 at::Tensor weight_int8_mm(const at::Tensor& x, const at::Tensor& w_packed, const at::Tensor& scales,
@@ -358,6 +403,14 @@ at::Tensor weight_int4_mm(const at::Tensor& x, const at::Tensor& w_packed, const
     const std::optional<at::Tensor>& x2)
 {
     return weight_int4_mm_vulkan(x, w_packed, scales, zeros, bias, rms_eps, rms_w, acc, x2);
+}
+
+at::Tensor weight_nf4_mm(const at::Tensor& x, const at::Tensor& w_packed, const at::Tensor& scales,
+    const std::optional<at::Tensor>& bias, const std::optional<double>& rms_eps,
+    const std::optional<at::Tensor>& rms_w, const std::optional<at::Tensor>& acc,
+    const std::optional<at::Tensor>& x2)
+{
+    return weight_nf4_mm_vulkan(x, w_packed, scales, bias, rms_eps, rms_w, acc, x2);
 }
 
 } // namespace torchvulkan

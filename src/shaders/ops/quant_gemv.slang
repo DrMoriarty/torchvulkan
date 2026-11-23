@@ -1,10 +1,15 @@
 module quant_gemv;
 
 // Weight-only quantized GEMV (matmul with M == 1): activations fp16/fp32,
-// weights int8 (one byte per k) or int4 (two nibbles per byte), dequantized in
+// weights int8 (one byte per k), int4 (two nibbles per byte) or NF4 (the same
+// nibble layout, nibble = index into the NormalFloat4 codebook), dequantized in
 // registers while streaming. Reuses the matmul_gemv pattern: one subgroup per
 // output column, weight reads coalesce along the row's contiguous k-stride,
 // the reduction goes through WaveActiveSum, accumulation in fp32.
+//
+// PACK is the compile-time payload tag (scripts/config.py): 8 = int8 byte,
+// 4 = int4 nibble with a per-group zero point, 2 = NF4 nibble with a codebook
+// lookup (same 2-nibbles-per-byte layout as int4, low nibble = even k).
 //
 // Weight layout: rows of N outputs, quantized along k. Each row is padded so
 // its byte stride (row_stride) is a multiple of 16 - padding nibbles/bytes are
@@ -13,14 +18,32 @@ module quant_gemv;
 // output row. int8 is symmetric: q = value / scale + 128 in [0, 255], the zero
 // is folded into the constant offset and the zeros tensor is not read. int4 is
 // asymmetric: value = (q - zero) * scale, q in [0, 15], low nibble = even k.
+// NF4 (QLoRA, Dettmers et al. 2023): value = nf4_code(q) * scale with the
+// per-block absmax as the scale, no zero point (code index 7 is exactly 0.0).
 //
 // Aligned path: lane covers PER_LANE consecutive k-values from one 32-bit
-// load (4 bytes for int8, 8 nibbles for int4), so a warp instruction reads
+// load (4 bytes for int8, 8 nibbles for int4/NF4), so a warp instruction reads
 // lanes * 4 contiguous bytes and every per-lane chunk sits inside one scale
 // group (group % PER_LANE == 0). Fallback path: one thread per output column,
 // scalar loads, per-element scale lookup.
 
 __exported import core.dtype;
+
+// NF4 codebook: 16 quantiles of the standard normal distribution (QLoRA,
+// Dettmers et al. 2023 — the published bitsandbytes constants), |max| normalized
+// to 1, strictly ascending, index 7 is exactly 0.0. Indexed dynamically by the
+// nibble (a 15-select ALU decode tree measured ~1.46x int4 GEMV time vs ~1.26x
+// for this constant-array form on the 5300M — the L1 loads hide better than the
+// serial select chain).
+static const float NF4_LUT[16] = {
+    -1.0,    -0.6962, -0.5251, -0.3949, -0.2844, -0.1848, -0.0911,  0.0,
+     0.0796,  0.1609,  0.2461,  0.3379,  0.4407,  0.5626,  0.7230,  1.0
+};
+
+float nf4_code(uint q)
+{
+    return NF4_LUT[q];
+}
 
 [[vk::constant_id(0)]] public const uint WG = 0;
 [[vk::constant_id(1)]] public const uint IS_ALIGNED = 1;
@@ -61,8 +84,8 @@ void quant_gemv_main<T : ITorchVulkan, let PACK : int>(
     uint3 wg : SV_GroupID,
     uniform QuantGemvPushConstants pcs)
 {
-    const uint PER_LANE = PACK == 4 ? 8 : 4; // k-values per lane per aligned iteration
-    const float OFFSET = PACK == 4 ? 0.0 : 128.0; // int4 keeps its zero in tensor_zeros
+    const uint PER_LANE = PACK == 8 ? 4 : 8; // k-values per lane per aligned iteration
+    const float OFFSET = PACK == 8 ? 128.0 : 0.0; // int8 folds its zero here; int4 keeps it in tensor_zeros; NF4 needs none
 
     // the batch rides the grid's z dimension
     uint b = wg.z;
@@ -87,7 +110,22 @@ void quant_gemv_main<T : ITorchVulkan, let PACK : int>(
         uint waves = WG / lanes; // output columns per workgroup
 
         uint n = wg.x * waves + wave;
-        if (n >= pcs.N) return;
+        // NF4 keeps every lane alive through the k-loop: each lane is a shuffle
+        // source for the codebook (WaveReadLaneAt below), so invalid tail columns
+        // clamp onto the last row instead of exiting — their reads stay in bounds
+        // and their results are discarded at the store. int8/int4 exit as before.
+        bool col_valid = true;
+        float lut_val = 0;
+        if (PACK == 2)
+        {
+            lut_val = NF4_LUT[WaveGetLaneIndex() & 15];
+            col_valid = n < pcs.N;
+            n = col_valid ? n : (pcs.N - 1);
+        }
+        else if (n >= pcs.N)
+        {
+            return;
+        }
 
         uint step = lanes * PER_LANE;
 
@@ -121,7 +159,7 @@ void quant_gemv_main<T : ITorchVulkan, let PACK : int>(
             float z = PACK == 4 ? zeros[g] : OFFSET;
             // row stride is a multiple of 16 bytes, every per-lane chunk 4-byte aligned:
             // the 32-bit weight word is indexed directly in the u32 view of the buffer
-            uint word = n * (pcs.row_stride >> 2) + (PACK == 4 ? (k >> 3) : (k >> 2));
+            uint word = n * (pcs.row_stride >> 2) + (PACK == 8 ? (k >> 2) : (k >> 3));
             uint wb = w32[word];
 
             // the whole per-lane chunk sits in one scale group
@@ -129,7 +167,12 @@ void quant_gemv_main<T : ITorchVulkan, let PACK : int>(
             [unroll]
             for (uint j = 0; j < PER_LANE; j++)
             {
-                uint q = PACK == 4 ? ((wb >> (4 * j)) & 0xF) : ((wb >> (8 * j)) & 0xFF);
+                uint q = PACK == 8 ? ((wb >> (8 * j)) & 0xFF) : ((wb >> (4 * j)) & 0xF);
+                // dequantized weight factor: NF4 fetches the codebook entry with a
+                // subgroup shuffle (lanes 0..15 hold the LUT — one ALU op instead
+                // of a constant-memory load per element), int8/int4 shift the
+                // integer code by the zero point
+                float wv = (PACK == 2) ? WaveReadLaneAt(lut_val, q) : (float(q) - z);
                 float coef = rrms;
                 if (pcs.tensor_rms_w != 0)
                     coef *= castValue<T, float>(rms_w[k + j]);
@@ -138,13 +181,13 @@ void quant_gemv_main<T : ITorchVulkan, let PACK : int>(
                     av = silu_v(castValue<T, float>(x[k + j])) * castValue<T, float>(x2[uint64_t(b) * pcs.K + k + j]);
                 else
                     av = castValue<T, float>(x[k + j]) * coef;
-                dot += (float(q) - z) * av;
+                dot += wv * av;
             }
             acc += dot * sc;
         }
         acc = WaveActiveSum(acc);
 
-        if (lane == 0)
+        if (lane == 0 && col_valid)
         {
             if (HAS_BIAS == 1) acc += castValue<T, float>(bias[n]);
             if (pcs.acc_flag == 1) acc += castValue<T, float>(acc_in[uint64_t(b) * pcs.N + n]);
@@ -175,17 +218,18 @@ void quant_gemv_main<T : ITorchVulkan, let PACK : int>(
         for (uint k = 0; k < pcs.K; k++)
         {
             uint q;
-            if (PACK == 4)
+            if (PACK == 8)
+            {
+                q = wrow[k];
+            }
+            else
             {
                 uint qb = wrow[k >> 1];
                 q = (k & 1) != 0 ? ((qb >> 4) & 0xF) : (qb & 0xF);
             }
-            else
-            {
-                q = wrow[k];
-            }
             uint g = n * pcs.ngroups + k / group;
             float z = PACK == 4 ? zeros[g] : OFFSET;
+            float wv = (PACK == 2) ? nf4_code(q) : (float(q) - z);
             float av;
             if (pcs.x2_flag == 1)
                 av = silu_v(castValue<T, float>(x[k])) * castValue<T, float>(x2[uint64_t(b) * pcs.K + k]);
@@ -196,7 +240,7 @@ void quant_gemv_main<T : ITorchVulkan, let PACK : int>(
                     coef *= castValue<T, float>(rms_w[k]);
                 av = castValue<T, float>(x[k]) * coef;
             }
-            acc += (float(q) - z) * scales[g] * av;
+            acc += wv * scales[g] * av;
         }
 
         if (HAS_BIAS == 1) acc += castValue<T, float>(bias[n]);

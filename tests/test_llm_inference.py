@@ -275,10 +275,11 @@ def test_llm_cpu_vs_vulkan_weights_identical():
 
 
 # =============================================================================================
-# Weight-only quantization (int8 / int4)
+# Weight-only quantization (int8 / int4 / nf4)
 # =============================================================================================
 # The same tiny-GPT cycle with every block linear running through the backend's private
-# weight-only quant matmuls (torch.ops.torchvulkan.weight_int8_mm / weight_int4_mm; kernels
+# weight-only quant matmuls (torch.ops.torchvulkan.weight_int8_mm / weight_int4_mm /
+# weight_nf4_mm; kernels
 # in src/api/ops/quant.cpp, shaders in src/shaders/ops/quant_gemv.slang). A single quant
 # mode for the whole run: prefill (M > 1) goes through the kernel's dequant+GEMM path,
 # decode (M == 1) through the quant-GEMV path.
@@ -290,9 +291,16 @@ def test_llm_cpu_vs_vulkan_weights_identical():
 #     q in [0, 255] (the -128 offset folded into zero);
 #   * int4: two nibbles per byte (low nibble = even k), asymmetric per-block scale+zero
 #     along K (``group`` k values per group), value = (q - zero) * scale, q in [0, 15];
-#   * int4 rows are zero-padded to a multiple of 16 bytes (wide kernel loads; never read).
+#   * nf4 (NormalFloat4, QLoRA — Dettmers et al. 2023): the same nibble layout as int4,
+#     the nibble is an index into the 16-entry normal-quantile codebook NF4_LUT,
+#     value = NF4_LUT[q] * scale with the per-block absmax as the scale (no zero point);
+#   * int4/nf4 rows are zero-padded to a multiple of 16 bytes (wide kernel loads; never read).
 
-ROW_ALIGN = 16  # experiments/quantize.py:ROW_ALIGN — int4 row padding in bytes
+ROW_ALIGN = 16  # experiments/quantize.py:ROW_ALIGN — int4/nf4 row padding in bytes
+
+# NormalFloat4 codebook (value-copy of torchvulkan/quantize.py:NF4_LUT)
+NF4_LUT = (-1.0, -0.6962, -0.5251, -0.3949, -0.2844, -0.1848, -0.0911, 0.0,
+           0.0796, 0.1609, 0.2461, 0.3379, 0.4407, 0.5626, 0.7230, 1.0)
 
 
 def quantize_int8(w):
@@ -333,6 +341,35 @@ def quantize_int4(w, group=64):
             zeros.view(N, ngroups).contiguous())
 
 
+def quantize_nf4(w, group=64):
+    """Value-copy of torchvulkan/quantize.py:quantize_nf4 (format source of truth):
+    (N, K) -> (uint8 (N, row_bytes), float32 scales (N, ngroups)), the same packed
+    layout as int4 but the nibble is the nearest NF4_LUT index and the per-block
+    scale is the block absmax; encoded by searchsorted against the 15 codebook
+    midpoints (O(1) nearest-neighbour binning per value)."""
+    wf = w.float()
+    N, K = wf.shape
+    Kpad = (K + group - 1) // group * group
+    if Kpad != K:
+        wf = torch.nn.functional.pad(wf, (0, Kpad - K))
+    ngroups = Kpad // group
+
+    blocks = wf.view(N, ngroups, group)
+    scales = blocks.abs().amax(dim=-1, keepdim=True).clamp_min(1e-12)
+    v = (blocks / scales).reshape(-1).double()
+    lut = torch.tensor(NF4_LUT, dtype=torch.float64)
+    mids = (lut[1:] + lut[:-1]) * 0.5
+    q = torch.searchsorted(mids, v).clamp_(0, 15).reshape(N, ngroups, group)
+    q = q.view(N, Kpad).to(torch.uint8)
+
+    lo, hi = q[:, 0::2], q[:, 1::2]
+    packed = lo | (hi << 4)
+    row_pad = (-packed.shape[1]) % ROW_ALIGN
+    if row_pad:
+        packed = torch.nn.functional.pad(packed, (0, row_pad))
+    return packed.contiguous(), scales.view(N, ngroups).contiguous()
+
+
 class QuantLinear(torch.nn.Module):
     """Drop-in replacement for an ``nn.Linear`` whose forward dispatches to the backend's
     private weight-only quant matmul on Vulkan; on CPU (the reference path) it dequantizes
@@ -345,10 +382,10 @@ class QuantLinear(torch.nn.Module):
     ``Module.to()`` never re-casts or re-moves them; weights are quantized on the fly
     from the fp32 initialisation of the layer being replaced."""
 
-    def __init__(self, linear: torch.nn.Linear, bits: int, group: int = 64,
+    def __init__(self, linear: torch.nn.Linear, bits, group: int = 64,
                  device="cpu", act_dtype: torch.dtype = torch.float32):
         super().__init__()
-        assert bits in (4, 8)
+        assert bits in (4, 8, "nf4")
         self.in_features = linear.in_features
         self.out_features = linear.out_features
         self.bits = bits
@@ -362,6 +399,9 @@ class QuantLinear(torch.nn.Module):
         if bits == 8:
             packed, scales = quantize_int8(linear.weight.detach())
             zeros = None
+        elif bits == "nf4":
+            packed, scales = quantize_nf4(linear.weight.detach(), group)
+            zeros = None
         else:
             packed, scales, zeros = quantize_int4(linear.weight.detach(), group)
         self.w_packed = packed.to(device)
@@ -374,10 +414,15 @@ class QuantLinear(torch.nn.Module):
         sc = self.qscales.detach().cpu()
         if self.bits == 8:
             return (wi - 128).float() * sc
-        z = self.qzeros.detach().cpu()
         ngroups = sc.shape[1]
         q = torch.stack((wi & 0xF, (wi >> 4) & 0xF), dim=-1).view(wi.shape[0], -1)
         q = q[:, :ngroups * self.group]
+        if self.bits == "nf4":
+            lut = torch.tensor(NF4_LUT, dtype=torch.float64)
+            deq = (lut[q.reshape(-1)].view(-1, ngroups, self.group)
+                   * sc.double().unsqueeze(-1)).view(wi.shape[0], -1)
+            return deq[:, :self.in_features].float()
+        z = self.qzeros.detach().cpu()
         deq = (q.view(-1, ngroups, self.group) - z.unsqueeze(-1)) * sc.unsqueeze(-1)
         return deq.view(wi.shape[0], -1)[:, :self.in_features]
 
@@ -387,6 +432,8 @@ class QuantLinear(torch.nn.Module):
             return torch.nn.functional.linear(x, w, self.bias)
         if self.bits == 8:
             return torch.ops.torchvulkan.weight_int8_mm(x, self.w_packed, self.qscales, self.bias)
+        if self.bits == "nf4":
+            return torch.ops.torchvulkan.weight_nf4_mm(x, self.w_packed, self.qscales, self.bias)
         return torch.ops.torchvulkan.weight_int4_mm(x, self.w_packed, self.qscales,
                                                     self.qzeros, self.bias)
 
@@ -404,7 +451,7 @@ def quantize_block_linears(model, bits, group=64, device="cpu", act_dtype=torch.
     return model
 
 
-def make_quant_models(device: torch.device, bits: int, act_dtype: torch.dtype = torch.float32):
+def make_quant_models(device: torch.device, bits, act_dtype: torch.dtype = torch.float32):
     """Three views of the same tiny GPT (identical weights via load_state_dict):
     the unquantized fp32 CPU reference, the quantized model on CPU (dequant reference
     path of QuantLinear) and the Vulkan model under test with the same packed weights."""
@@ -433,10 +480,12 @@ def time_generate(model, prompt, steps: int = GEN_STEPS):
 QUANT_TOL = {
     8: dict(rtol=2e-3, atol=2e-3),
     4: dict(rtol=5e-3, atol=5e-3),
+    "nf4": dict(rtol=5e-3, atol=5e-3),
 }
 QUANT_TOL_FP16_ACT = {
     8: dict(rtol=5e-3, atol=5e-3),
     4: dict(rtol=1e-2, atol=1e-2),
+    "nf4": dict(rtol=1e-2, atol=1e-2),
 }
 
 
@@ -444,14 +493,14 @@ def _assert_finite(t, what):
     assert torch.isfinite(t).all(), f"{what}: non-finite values"
 
 
-@pytest.mark.parametrize("bits", [8, 4], ids=["int8", "int4"])
+@pytest.mark.parametrize("bits", [8, 4, "nf4"], ids=["int8", "int4", "nf4"])
 def test_llm_weight_quant(bits):
     """End-to-end quantized cycle in fp32 activations: prefill logits against the CPU
     dequant reference (kernel-error tolerance), greedy decode with KV cache against the
     same reference, run-to-run determinism, all values finite; timings vs fp32 printed."""
     t_test = time.perf_counter()
     device = vulkan_device()
-    print(f"\n[int{bits}] vulkan device: {torchvulkan.get_device_name(device)} (index {device.index})")
+    print(f"\n[{bits}] vulkan device: {torchvulkan.get_device_name(device)} (index {device.index})")
 
     fp32_ref, cpu_quant, vk_quant = make_quant_models(device, bits)
     prompt = make_prompt().to(device)
@@ -501,7 +550,7 @@ def test_llm_weight_quant(bits):
     print(f"timings (fp32 activations, after warmup; {GEN_STEPS} decode steps):")
     print(f"  {'mode':<6}{'prefill ms':>12}{'prefill tok/s':>16}"
           f"{'decode ms/step':>18}{'decode tok/s':>16}")
-    for name, (pf, st) in ((f"int{bits}", (prefill_s, mean_step)), ("fp32", (fp32_prefill, fp32_step))):
+    for name, (pf, st) in ((str(bits), (prefill_s, mean_step)), ("fp32", (fp32_prefill, fp32_step))):
         print(f"  {name:<6}{pf * 1e3:>12.2f}{PROMPT_LEN / pf:>16.1f}"
               f"{st * 1e3:>18.2f}{1 / st:>16.1f}")
 
@@ -510,13 +559,13 @@ def test_llm_weight_quant(bits):
     assert elapsed < TOTAL_TIME_BUDGET_S, f"test took {elapsed:.1f} s, budget is {TOTAL_TIME_BUDGET_S:.0f} s"
 
 
-@pytest.mark.parametrize("bits", [8, 4], ids=["int8", "int4"])
+@pytest.mark.parametrize("bits", [8, 4, "nf4"], ids=["int8", "int4", "nf4"])
 def test_llm_weight_quant_fp16_activations(bits):
     """fp16 activations exercise the f16 template variants of the quant kernels
-    (quant_gemv_w{8,4}_f16): prefill + a few cached decode steps, logits against the
+    (quant_gemv_w{8,4}/nf4 f16): prefill + a few cached decode steps, logits against the
     fp32 CPU dequant reference with the fp16 activation rounding folded into the tolerance."""
     device = vulkan_device()
-    print(f"\n[int{bits} fp16-act] vulkan device: {torchvulkan.get_device_name(device)}")
+    print(f"\n[{bits} fp16-act] vulkan device: {torchvulkan.get_device_name(device)}")
     _, cpu_quant, vk_quant = make_quant_models(device, bits, act_dtype=torch.float16)
     prompt = make_prompt().to(device)
 

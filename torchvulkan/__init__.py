@@ -215,6 +215,18 @@ def weight_int4_mm(x, w_packed, scales, zeros, bias=None) -> torch.Tensor:
     """
     return torch.ops.torchvulkan.weight_int4_mm(x, w_packed, scales, zeros, bias)
 
+def weight_nf4_mm(x, w_packed, scales, bias=None) -> torch.Tensor:
+    """Weight-only NF4 (NormalFloat4) matmul: out = x @ dequant(w_packed).T (+ bias).
+
+    w_packed uint8 (N, ceil(K/2) rounded up to a multiple of 16 per row), two
+    nibbles per byte (low nibble = even k); the nibble is an index into the
+    16-entry NormalFloat4 codebook (QLoRA, Dettmers et al. 2023), scales float32
+    (N, ngroups) are the per-group absmax: value = NF4_LUT[q] * scale. x
+    fp16/fp32, out in x.dtype. Rows may be padded - padding is never read.
+    See torchvulkan.quantize.quantize_nf4 for the packing.
+    """
+    return torch.ops.torchvulkan.weight_nf4_mm(x, w_packed, scales, bias)
+
 def _is_in_bad_fork() -> bool:
     return _C._is_in_bad_fork()
 

@@ -247,13 +247,18 @@ KERNELS = [
     Kernel('add_relu', 'ops/add_relu.slang', [
         Entry('add_relu_main', [F16, F32]),
     ]),
-    # weight-only quantized GEMV (M == 1): fp16/fp32 activations, int8/int4
-    # weights dequantized in registers; PACK is the bits-per-weight constant
+    # weight-only quantized GEMV (M == 1): fp16/fp32 activations, int8/int4/NF4
+    # weights dequantized in registers; PACK is the payload tag: 8 = int8 byte,
+    # 4 = int4 nibble (+ per-group zero point), 2 = NF4 nibble (codebook lookup,
+    # same nibble layout as int4)
     Kernel('quant_gemv_w8', 'ops/quant_gemv.slang', [
         Entry('quant_gemv_main', [F16, F32], (), constants=(8,)),
     ]),
     Kernel('quant_gemv_w4', 'ops/quant_gemv.slang', [
         Entry('quant_gemv_main', [F16, F32], (), constants=(4,)),
+    ]),
+    Kernel('quant_gemv_nf4', 'ops/quant_gemv.slang', [
+        Entry('quant_gemv_main', [F16, F32], (), constants=(2,)),
     ]),
     # fused RMSNorm (statistics in fp32, one subgroup per row, weight applied
     # in-kernel) and fused rotate-half RoPE for precomputed full-size tables:

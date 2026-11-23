@@ -52,11 +52,16 @@ at::Tensor weight_int4_mm(const at::Tensor& x, const at::Tensor& w_packed, const
     const at::Tensor& zeros, const c10::optional<at::Tensor>& bias, const c10::optional<double>& rms_eps,
     const c10::optional<at::Tensor>& rms_w, const c10::optional<at::Tensor>& acc,
     const c10::optional<at::Tensor>& x2);
+at::Tensor weight_nf4_mm(const at::Tensor& x, const at::Tensor& w_packed, const at::Tensor& scales,
+    const c10::optional<at::Tensor>& bias, const c10::optional<double>& rms_eps,
+    const c10::optional<at::Tensor>& rms_w, const c10::optional<at::Tensor>& acc,
+    const c10::optional<at::Tensor>& x2);
 // host-side dequantization of a packed weight-only matrix (kernel semantics of
-// the M>1 path of weight_int*_mm) — the lora.py train path uses it for
-// grad_x = grad_out @ deq(W) and optional per-layer dequant caches
+// the M>1 path of weight_*_mm) — the lora.py train path uses it for
+// grad_x = grad_out @ deq(W) and optional per-layer dequant caches;
+// format: 0 = int8, 1 = int4, 2 = nf4
 at::Tensor weight_dequant(const at::Tensor& w_packed, const at::Tensor& scales,
-    const c10::optional<at::Tensor>& zeros, bool is_int4, int64_t K, at::ScalarType out_dtype);
+    const c10::optional<at::Tensor>& zeros, int64_t format, int64_t K, at::ScalarType out_dtype);
 
 // ops/fused.cpp
 at::Tensor rms_norm_fused(const at::Tensor& x, const at::Tensor& w, double eps);

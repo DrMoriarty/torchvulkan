@@ -1,7 +1,8 @@
-"""QLoRA-style LoRA adapters over weight-only int8/int4 quantized ``nn.Linear`` layers.
+"""QLoRA-style LoRA adapters over weight-only int8/int4/NF4 quantized ``nn.Linear`` layers.
 
-The base weights stay packed (int8 per-row / int4 group-64 asymmetric, format in
-``torchvulkan.quantize``) and frozen; every wrapped linear runs
+The base weights stay packed (int8 per-row / int4 group-64 asymmetric / NF4
+group-64 normal-quantile codebook, formats in ``torchvulkan.quantize``) and
+frozen; every wrapped linear runs
 
     y = quant_mm(x, Wq) + s * (x @ A^T) @ B^T,      s = alpha / r
 
@@ -12,8 +13,9 @@ gradients — the packed weights are plain non-parameter attributes and never
 enter autograd.
 
 The autograd pair ``_QuantLinear`` closes blocker #1 of the quant training path:
-``weight_int8_mm`` / ``weight_int4_mm`` are registered on PrivateUse1 only (their
-outputs have no grad_fn), so the train path goes through this Function instead:
+``weight_int8_mm`` / ``weight_int4_mm`` / ``weight_nf4_mm`` are registered on
+PrivateUse1 only (their outputs have no grad_fn), so the train path goes through
+this Function instead:
 forward is the existing op (M==1 quant-GEMV kernel; M>1 dequant+GEMM, or a plain
 GEMM on an optional dequantized-weight cache), backward computes
 
@@ -31,7 +33,7 @@ Typical use (transformers model on vulkan fp16):
     from torchvulkan.lora import (patch_lora_linear, mark_only_lora_trainable,
                                   lora_parameters, AdamWFused16-compatible)
 
-    patch_lora_linear(model, bits=4, group=64, r=16, alpha=32.0)
+    patch_lora_linear(model, bits="nf4", group=64, r=16, alpha=32.0)
     mark_only_lora_trainable(model)
     opt = torchvulkan.optim.AdamWFused16(lora_parameters(model), lr=1e-4)
 """
@@ -39,37 +41,57 @@ import math
 
 import torch
 
-from .quantize import quantize_int4, quantize_int8, quantize_weight
+from .quantize import NF4_LUT, quantize_int4, quantize_int8, quantize_nf4, quantize_weight
 
 _int8_mm_op = torch.ops.torchvulkan.weight_int8_mm
 _int4_mm_op = torch.ops.torchvulkan.weight_int4_mm
+_nf4_mm_op = torch.ops.torchvulkan.weight_nf4_mm
 _dequant_op = torch.ops.torchvulkan.weight_dequant
 
+# format names -> the `format` codes of the private weight_dequant op
+_FMT_CODES = {"int8": 0, "int4": 1, "nf4": 2}
 
-def dequantize_weight(w_packed, scales, zeros, is_int4, K, dtype=None):
+
+def _norm_fmt(fmt):
+    """Normalize a format spec: legacy bools (is_int4) -> "int4"/"int8"."""
+    if fmt is True:
+        return "int4"
+    if fmt is False:
+        return "int8"
+    assert fmt in _FMT_CODES, f"unknown weight-only quant format: {fmt!r}"
+    return fmt
+
+
+def dequantize_weight(w_packed, scales, zeros, fmt, K, dtype=None):
     """Dequantize a packed weight-only matrix to ``dtype`` (kernel semantics).
 
     w_packed: (N, row_bytes) uint8; scales: (N, ngroups) fp32; zeros: (N, ngroups)
-    fp32 for int4 (None for int8); K: the logical k-length (the packed rows may
+    fp32 for int4 (None for int8/nf4); fmt: "int8" / "int4" / "nf4" (legacy bools:
+    True -> "int4", False -> "int8"); K: the logical k-length (the packed rows may
     be padded beyond it); dtype: fp16/fp32 (default fp16). Vulkan tensors go
     through the private ``weight_dequant`` op, CPU tensors through the same
     nibble layout in plain aten (reference paths).
     """
+    fmt = _norm_fmt(fmt)
     if w_packed.device.type == "vulkan":
-        return _dequant_op(w_packed, scales, zeros, is_int4, K, dtype or torch.float16)
+        return _dequant_op(w_packed, scales, zeros, _FMT_CODES[fmt], K, dtype or torch.float16)
     wi = w_packed.detach().cpu().to(torch.int64)
     N, row_bytes = wi.shape
     sc = scales.detach().cpu()
     ngroups = sc.shape[1]
-    if is_int4:
+    group = K // ngroups
+    if fmt == "int8":
+        q = wi - 128
+        centered = q.view(N, ngroups, group)
+        deq = centered * sc.double().unsqueeze(-1)
+    elif fmt == "nf4":
+        q = torch.stack((wi & 0xF, (wi >> 4) & 0xF), dim=-1).view(N, row_bytes * 2)[:, :K]
+        lut = torch.tensor(NF4_LUT, dtype=torch.float64)
+        deq = (lut[q.reshape(-1)].view(N, ngroups, group) * sc.double().unsqueeze(-1))
+    else:
         q = torch.stack((wi & 0xF, (wi >> 4) & 0xF), dim=-1).view(N, row_bytes * 2)[:, :K]
         z = zeros.detach().cpu().double()
-    else:
-        q = wi - 128
-        z = None
-    group = K // ngroups
-    centered = q.view(N, ngroups, group) - (z.unsqueeze(-1) if is_int4 else 0)
-    deq = centered * sc.double().unsqueeze(-1)
+        deq = (q.view(N, ngroups, group) - z.unsqueeze(-1)) * sc.double().unsqueeze(-1)
     deq = deq.view(N, K)
     if dtype is not None:
         deq = deq.to(dtype)
@@ -89,7 +111,8 @@ class _QuantLinear(torch.autograd.Function):
     """
 
     @staticmethod
-    def forward(ctx, x, w_packed, scales, zeros, bias, dequant):
+    def forward(ctx, x, w_packed, scales, zeros, bias, dequant, fmt=None):
+        fmt = _norm_fmt(fmt) if fmt is not None else ("int4" if zeros is not None else "int8")
         K = x.shape[-1]
         rows = x.numel() // K
         N = w_packed.shape[0]
@@ -100,6 +123,7 @@ class _QuantLinear(torch.autograd.Function):
         ctx.scales = scales
         ctx.zeros = zeros
         ctx.bias = bias
+        ctx.fmt = fmt
         b = bias if bias is None or bias.dtype == x.dtype else bias.to(x.dtype)
         if dequant is not None and rows > 1 and x.device.type == "vulkan" \
                 and dequant.dtype == x.dtype:
@@ -109,10 +133,12 @@ class _QuantLinear(torch.autograd.Function):
             return out.reshape(*x.shape[:-1], N)
         if x.device.type != "vulkan":
             w = dequant if dequant is not None else dequantize_weight(
-                w_packed, scales, zeros, zeros is not None, K, x.dtype)
+                w_packed, scales, zeros, fmt, K, x.dtype)
             return torch.nn.functional.linear(x, w.to(x.dtype), b)
-        if zeros is None:
+        if fmt == "int8":
             return _int8_mm_op(x, w_packed, scales, b)
+        if fmt == "nf4":
+            return _nf4_mm_op(x, w_packed, scales, b)
         return _int4_mm_op(x, w_packed, scales, zeros, b)
 
     @staticmethod
@@ -121,25 +147,27 @@ class _QuantLinear(torch.autograd.Function):
         deq = ctx.dequant
         if deq is None:
             deq = dequantize_weight(ctx.w_packed, ctx.scales, ctx.zeros,
-                                    ctx.zeros is not None, K, grad_out.dtype)
+                                    ctx.fmt, K, grad_out.dtype)
         elif deq.dtype != grad_out.dtype:
             deq = deq.to(grad_out.dtype)
         g = grad_out.reshape(-1, ctx.N).contiguous()
         grad_x = torch.matmul(g, deq).reshape(ctx.x_shape) if ctx.needs_input_grad[0] else None
         grad_bias = g.sum(0) if ctx.needs_input_grad[4] else None
-        return grad_x, None, None, None, grad_bias, None
+        return grad_x, None, None, None, grad_bias, None, None
 
 
-def quantized_linear(x, w_packed, scales, zeros=None, bias=None, dequant=None):
+def quantized_linear(x, w_packed, scales, zeros=None, bias=None, dequant=None, fmt=None):
     """Weight-only quantized matmul with a backward pass: y = x @ deq(W)^T (+ bias).
 
     x: (..., K) fp16/fp32; w_packed/scales/zeros: the packing of
     ``torchvulkan.quantize.quantize_weight`` (zeros only for int4); bias: (N,)
     in x.dtype (frozen — no gradient); dequant: optional (N, K) cache of the
     dequantized weight in x.dtype (speeds up M>1 forward and backward;
-    recompute otherwise). The packed weights receive no gradient.
+    recompute otherwise); fmt: "int8"/"int4"/"nf4" — inferred from ``zeros``
+    (int4 vs int8) when None, pass "nf4" explicitly for the NF4 format. The
+    packed weights receive no gradient.
     """
-    return _QuantLinear.apply(x, w_packed, scales, zeros, bias, dequant)
+    return _QuantLinear.apply(x, w_packed, scales, zeros, bias, dequant, fmt)
 
 
 # ---------------------------------------------------------------- LoRA patcher
@@ -157,16 +185,16 @@ def _make_lora_forward(mod):
     zeros, bias = mod.qzeros, getattr(mod, "_lora_bias", None)
     A, B, scale = mod.lora_A, mod.lora_B, mod.lora_scaling
     K = mod.in_features
-    is_int4 = zeros is not None
+    fmt = getattr(mod, "_lora_fmt", None) or ("int4" if zeros is not None else "int8")
 
     def forward(x):
         deq = getattr(mod, _DEQ_CACHE_ATTR, None)
         if deq is None and mod.lora_dequant_cache:
-            deq = dequantize_weight(packed, scales, zeros, is_int4, K, x.dtype)
+            deq = dequantize_weight(packed, scales, zeros, fmt, K, x.dtype)
             setattr(mod, _DEQ_CACHE_ATTR, deq)
         a = A if A.dtype == x.dtype else A.to(x.dtype)
         b = B if B.dtype == x.dtype else B.to(x.dtype)
-        base = _QuantLinear.apply(x, packed, scales, zeros, bias, deq)
+        base = _QuantLinear.apply(x, packed, scales, zeros, bias, deq, fmt)
         delta = torch.matmul(torch.matmul(x, a.t()), b.t())
         return base + (scale * delta).to(base.dtype)
 
@@ -179,6 +207,9 @@ def patch_lora_linear(model, bits=4, group=64, r=16, alpha=32.0,
     """Wrap every target ``nn.Linear`` of ``model`` with a frozen weight-only
     quantized base plus trainable LoRA adapters (in place, instance-level
     forward override like the fused_train.py patchers).
+
+    ``bits``: 4 (int4 group-64 asymmetric), 8 (int8 per-row) or "nf4" (NF4
+    group-64 normal-quantile codebook — the QLoRA recipe).
 
     The fp16/fp32 ``module.weight`` is quantized on CPU (deterministic, strict-
     safe) with ``quantize_weight(bits, group)``, kept as plain attributes
@@ -195,7 +226,7 @@ def patch_lora_linear(model, bits=4, group=64, r=16, alpha=32.0,
     tie with the embedding). Returns the number of patched modules. Idempotent
     (already-patched modules are skipped).
     """
-    assert bits in (4, 8)
+    assert bits in (4, 8, "nf4")
     patched = 0
     for name, module in model.named_modules():
         if not isinstance(module, torch.nn.Linear) or module.weight is None:
@@ -209,12 +240,13 @@ def patch_lora_linear(model, bits=4, group=64, r=16, alpha=32.0,
         dev = w.device
         if bits == 4:
             packed, scales, zeros = quantize_weight(w.float().cpu(), bits, group)
-        else:
+        else:  # int8 and nf4: two-tuple packing, no zero points
             packed, scales = quantize_weight(w.float().cpu(), bits, group)
             zeros = None
         module.w_packed = packed.to(dev)
         module.qscales = scales.to(dev)
         module.qzeros = None if zeros is None else zeros.to(dev)
+        module._lora_fmt = "nf4" if bits == "nf4" else f"int{bits}"
         if module.bias is not None:
             module._lora_bias = module.bias.detach().to(device=dev, dtype=adapter_dtype)
             module.bias = None
@@ -252,7 +284,7 @@ def unpatch_lora(model, restore_weight=True) -> int:
         module.forward = orig
         delattr(module, _LORA_ATTR)
         for attr in ("lora_A", "lora_B", "lora_scaling", "lora_dequant_cache",
-                     "w_packed", "qscales", "qzeros", "_lora_bias"):
+                     "w_packed", "qscales", "qzeros", "_lora_bias", "_lora_fmt"):
             if hasattr(module, attr):
                 delattr(module, attr)
         deq = getattr(module, _DEQ_CACHE_ATTR, None)
