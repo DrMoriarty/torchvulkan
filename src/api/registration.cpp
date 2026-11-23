@@ -44,11 +44,11 @@ TORCH_LIBRARY(torchvulkan, m) {
     m.def("attn_decode(Tensor q, Tensor k_cache, Tensor v_cache, int cur, Tensor? k_cur=None, Tensor? v_cur=None, Tensor? qkn_w=None, Tensor? cos=None, Tensor? sin=None, float? eps=None) -> Tensor");
     m.def("silu_mul(Tensor g, Tensor u) -> Tensor");
     m.def("add_relu(Tensor a, Tensor b, float alpha=1.0, Tensor? pre=None) -> (Tensor, Tensor)");
-    // fused causal SDPA internals (ops/sdpa.cpp): the private pieces behind the
+    // fused SDPA internals (ops/sdpa.cpp): the private pieces behind the
     // aten::scaled_dot_product_attention AutogradPrivateUse1 override
-    m.def("sdpa_fwd(Tensor q, Tensor k, Tensor v, float scale) -> (Tensor, Tensor)");
+    m.def("sdpa_fwd(Tensor q, Tensor k, Tensor v, Tensor? mask=None, bool is_causal=True, float scale=1.0) -> (Tensor, Tensor)");
     m.def("sdpa_rowdot(Tensor a, Tensor b) -> Tensor");
-    m.def("sdpa_ds(Tensor probs, Tensor dp, Tensor delta, int l, float scale) -> Tensor");
+    m.def("sdpa_ds(Tensor probs, Tensor dp, Tensor delta, int l, bool is_causal=True, float scale=1.0) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(torchvulkan, PrivateUse1, m) {

@@ -5,8 +5,9 @@ module sdpa;
 // a dozen pointwise/reduction kernels fwd, and the autograd graph over the
 // same ops bwd. Three kernels:
 //
-//   sdpa_fwd_main   QK^T (causal) + softmax + P*V in one kernel, one
-//                   workgroup of WG threads per R q-rows (b, h, row-tile).
+//   sdpa_fwd_main   QK^T (+ additive mask) + causal-masked softmax + P*V in
+//                   one kernel, one workgroup of WG threads per R q-rows
+//                   (b, h, row-tile).
 //                   Two passes, no score row in groupshared memory: pass 1
 //                   streams the thread's scores (j = ti, ti+WG, ...) keeping
 //                   only the running max and denominator in registers (online
@@ -22,7 +23,8 @@ module sdpa;
 //                   (dS = P*(dP - delta), dV = P^T @ dO), so no logsumexp
 //                   and no score recompute in backward.
 //   sdpa_rowdot_main  delta[r] = sum_d dO[r, d] * out[r, d] (one thread per row)
-//   sdpa_ds_main      dS = P * (dP - delta[row]) with the causal entries zeroed
+//   sdpa_ds_main      dS = P * (dP - delta[row]); causal entries zeroed when
+//                     the forward was causal (masked entries are already 0 in P)
 //
 // The backward's four GEMMs (dP = dO @ V^T, dQ = dS @ K, dK = dS^T @ Q,
 // dV = P^T @ dO) stay on the regular matmul kernels: hand-rolled fused
@@ -30,11 +32,15 @@ module sdpa;
 // to the GEMMs on the 5300M at these shapes — the GEMM kernels win on
 // occupancy and load scheduling even for skinny (128, 64) batches.
 //
-// Semantics match the math path: the mask is j <= i (at::ones(L,S).tril(),
-// top-left aligned, also for L != S), the effective scale folded into the
-// scores is calculate_scale (1/sqrt(head_dim) or the user's value). GQA maps
-// q head h to kv group g = h / qpg — the same per-head math the math path's
-// repeat_interleave expansion produces. All accumulation fp32.
+// Semantics match the math path: with causal the mask is j <= i
+// (at::ones(L,S).tril(), top-left aligned, also for L != S); an additive mask
+// (fp32, 0 / -inf after the bool conversion on the host) is added to the
+// scores before the softmax, with any strides broadcast over (L, S). The
+// effective scale folded into the scores is calculate_scale (1/sqrt(head_dim)
+// or the user's value). GQA maps q head h to kv group g = h / qpg — the same
+// per-head math the math path's repeat_interleave expansion produces. All
+// accumulation fp32; a fully masked row gives zeros everywhere (the math
+// path's _safe_softmax contract), the denominator guard below.
 
 __exported import core.dtype;
 import core.indexing;
@@ -62,6 +68,12 @@ public struct SdpaFwdPushConstants
     public uint rows_x;           // row-groups per y slice (grid y-split)
     public uint tph;              // tiles per head: ceil(L / R)
     public float scale;           // effective multiplier on q.k^T
+    public uint64_t tensor_mask;  // additive fp32 mask, read via the strides
+                                  // below; 0 when has_mask == 0
+    public uint mask_stride0;     // elements, per L index (0 for broadcast)
+    public uint mask_stride1;     // elements, per S index (0 for broadcast)
+    public uint has_mask;
+    public uint causal;           // 1 = top-left aligned tril j <= i
 }
 
 // lane reduction scratch (max / den / weights), R строк тайла рядами:
@@ -91,6 +103,7 @@ void sdpa_fwd_main<T : ITorchVulkan, let WG : int, let R : int>(
     T* V = (T*)pcs.tensor_v + (b_idx * pcs.hkv + g) * pcs.s_dim * pcs.hd;
     T* prob_base = (T*)pcs.tensor_probs
         + ((b_idx * pcs.hkv + g) * pcs.qpg + (h - g * pcs.qpg)) * pcs.l_dim * pcs.s_dim;
+    float* M = (float*)pcs.tensor_mask;
 
     bool vec = (sizeof(T) == 2) && (pcs.hd % 8 == 0);
     uint wcnt = vec ? pcs.hd / 8 : 0;
@@ -102,10 +115,11 @@ void sdpa_fwd_main<T : ITorchVulkan, let WG : int, let R : int>(
     uint4* q4 = (uint4*)pcs.tensor_q;
     uint qbase4 = head * pcs.l_dim * wcnt + i0 * wcnt; // строка r: + r * wcnt
 
-    // строка r активна, пока i0 + r < l_dim; её каузальная граница jmax_r
+    // строка r активна, пока i0 + r < l_dim; при causal верхняя граница j —
+    // каузальная, без causal считаются все j < S
     float m_lane[R];
     float den_lane[R];
-    uint jmax_hi = min(i0 + R, pcs.s_dim); // верхняя граница j по всем строкам
+    uint jmax_hi = (pcs.causal != 0) ? min(i0 + R, pcs.s_dim) : pcs.s_dim;
     [ForceUnroll]
     for (uint r = 0; r < R; r++)
     {
@@ -165,9 +179,13 @@ void sdpa_fwd_main<T : ITorchVulkan, let WG : int, let R : int>(
         for (uint r = 0; r < R; r++)
         {
             uint im = i0 + r;
-            if (im < pcs.l_dim && j < im + 1 && j < pcs.s_dim)
+            if (im < pcs.l_dim && j < pcs.s_dim && (pcs.causal == 0 || j <= im))
             {
-                float s = ((acc0[r] + acc1[r]) + (acc2[r] + acc3[r])) * pcs.scale;
+                // additive mask (0 / -inf / пользовательский bias) к скору до
+                // softmax — семантика math-пути; -inf даёт w = exp(-inf) = 0
+                float mv = (pcs.has_mask != 0)
+                    ? M[im * pcs.mask_stride0 + j * pcs.mask_stride1] : 0.0;
+                float s = ((acc0[r] + acc1[r]) + (acc2[r] + acc3[r])) * pcs.scale + mv;
                 float m_new = max(m_lane[r], s);
                 den_lane[r] = den_lane[r] * exp(m_lane[r] - m_new) + exp(s - m_new);
                 m_lane[r] = m_new;
@@ -205,8 +223,10 @@ void sdpa_fwd_main<T : ITorchVulkan, let WG : int, let R : int>(
         [ForceUnroll]
         for (uint r = 0; r < R; r++) inv_den[r] += smem_red[r * WG + t];
     }
+    // гвард _safe_softmax: строка, замаскированная целиком, даёт den = 0 —
+    // нулевой inv_den записывает нули в P и out (а не NaN от 1/0)
     [ForceUnroll]
-    for (uint r = 0; r < R; r++) inv_den[r] = 1.0 / inv_den[r];
+    for (uint r = 0; r < R; r++) inv_den[r] = (inv_den[r] > 0.0) ? 1.0 / inv_den[r] : 0.0;
     // и перед весами chunk'а pass 2 — сканы den тоже могли не завершиться
     GroupMemoryBarrierWithGroupSync();
 
@@ -272,9 +292,11 @@ void sdpa_fwd_main<T : ITorchVulkan, let WG : int, let R : int>(
             for (uint r = 0; r < R; r++)
             {
                 uint im = i0 + r;
-                if (im < pcs.l_dim && j < im + 1 && j < pcs.s_dim)
+                if (im < pcs.l_dim && j < pcs.s_dim && (pcs.causal == 0 || j <= im))
                 {
-                    float s = ((acc0[r] + acc1[r]) + (acc2[r] + acc3[r])) * pcs.scale;
+                    float mv = (pcs.has_mask != 0)
+                        ? M[im * pcs.mask_stride0 + j * pcs.mask_stride1] : 0.0;
+                    float s = ((acc0[r] + acc1[r]) + (acc2[r] + acc3[r])) * pcs.scale + mv;
                     w[r] = exp(s - m_glob[r]);
                 }
             }
@@ -300,10 +322,12 @@ void sdpa_fwd_main<T : ITorchVulkan, let WG : int, let R : int>(
         // MoltenVK не софт-пайплайнится компилятором)
         if (ti < pcs.hd)
         {
-            uint jstop_0 = min(i0 + 1, pcs.s_dim) - c0; // строка 0 — самая короткая
+            // видимая граница строки при causal (без causal — вся S); строка 0
+            // тайла — самая короткая
+            uint jstop_0 = ((pcs.causal != 0) ? min(i0 + 1, pcs.s_dim) : pcs.s_dim) - c0;
             // последняя активная строка тайла: тайл может пересекать границу l_dim
             uint i_last = min(i0 + R, pcs.l_dim) - 1;
-            uint jstop_max = min(i_last + 1, pcs.s_dim) - c0;
+            uint jstop_max = ((pcs.causal != 0) ? min(i_last + 1, pcs.s_dim) : pcs.s_dim) - c0;
             uint chunk = min(pcs.s_dim - c0, (uint)WG);
             uint main_stop = min(jstop_0, chunk);
             uint main4 = main_stop & ~3u;
@@ -347,7 +371,8 @@ void sdpa_fwd_main<T : ITorchVulkan, let WG : int, let R : int>(
                 [ForceUnroll]
                 for (uint r = 0; r < R; r++)
                 {
-                    uint jstop = (i0 + r < pcs.l_dim) ? min(i0 + r + 1, pcs.s_dim) - c0 : 0;
+                    uint jstop = (i0 + r < pcs.l_dim)
+                        ? (((pcs.causal != 0) ? min(i0 + r + 1, pcs.s_dim) : pcs.s_dim) - c0) : 0;
                     if (jj < jstop) acc0o[r] += smem_red[r * WG + jj] * v0;
                 }
             }
@@ -422,7 +447,9 @@ void sdpa_rowdot_main<T : ITorchVulkan>(
 }
 
 // ---------------------------------------------------------------------------
-// dS = scale * P * (dP - delta[row]) with the causal entries zeroed.
+// dS = scale * P * (dP - delta[row]), with the causal entries zeroed when the
+// forward ran causal (the mask itself needs no handling here: masked entries
+// have P == 0 exactly — exp(-inf) — so their dS is 0 through the product).
 // The forward folded the scale into the scores, so the chain back to q/k is
 // ds_ij/dq_i = scale * k_j — one extra multiply here covers both dQ and dK
 // (dV reads P directly and needs no scale).
@@ -443,6 +470,7 @@ public struct SdpaDsPushConstants
     public uint l_dim;
     public uint blocks_x;         // element-blocks per y slice (grid y-split)
     public float scale;           // effective multiplier on q.k^T
+    public uint causal;           // 1 = zero dS past the diagonal (j > i)
 }
 
 [shader("compute")]
@@ -476,14 +504,15 @@ void sdpa_ds_main<T : ITorchVulkan>(
         // dP в том же T, что и probs: те же пары lo/hi по словам
         float4 ld = f16tof32(wd), dd = f16tof32(wd >> 16);
         float dl = delta[row];
-        float p0 = (j + 0 <= i) ? lp.x : 0.0;
-        float p1 = (j + 1 <= i) ? hp.x : 0.0;
-        float p2 = (j + 2 <= i) ? lp.y : 0.0;
-        float p3 = (j + 3 <= i) ? hp.y : 0.0;
-        float p4v = (j + 4 <= i) ? lp.z : 0.0;
-        float p5 = (j + 5 <= i) ? hp.z : 0.0;
-        float p6 = (j + 6 <= i) ? lp.w : 0.0;
-        float p7 = (j + 7 <= i) ? hp.w : 0.0;
+        bool c0m = pcs.causal != 0;
+        float p0 = (!c0m || j + 0 <= i) ? lp.x : 0.0;
+        float p1 = (!c0m || j + 1 <= i) ? hp.x : 0.0;
+        float p2 = (!c0m || j + 2 <= i) ? lp.y : 0.0;
+        float p3 = (!c0m || j + 3 <= i) ? hp.y : 0.0;
+        float p4v = (!c0m || j + 4 <= i) ? lp.z : 0.0;
+        float p5 = (!c0m || j + 5 <= i) ? hp.z : 0.0;
+        float p6 = (!c0m || j + 6 <= i) ? lp.w : 0.0;
+        float p7 = (!c0m || j + 7 <= i) ? hp.w : 0.0;
         // dP распаковывается так же, как probs: в слове чётный элемент в
         // младших битах (ld), нечётный — в старших (dd): j+0 -> ld.x,
         // j+1 -> dd.x, j+2 -> ld.y, ...
@@ -512,7 +541,7 @@ void sdpa_ds_main<T : ITorchVulkan>(
         T* dp = (T*)pcs.tensor_dp;
         T* out = (T*)pcs.tensor_out;
         float* delta = (float*)pcs.tensor_delta;
-        float pv = (j <= i) ? castValue<T, float>(p[idx]) : 0.0;
+        float pv = (pcs.causal == 0 || j <= i) ? castValue<T, float>(p[idx]) : 0.0;
         float dsv = pv * (castValue<T, float>(dp[idx]) - delta[row]) * pcs.scale;
         out[idx] = castValue<float, T>(dsv);
     }

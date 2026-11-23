@@ -4,11 +4,12 @@
 #include <ATen/ops/_scaled_dot_product_attention_math_native.h>
 #include <cmath>
 #include <cstdlib>
+#include <optional>
 #include "vulkan/memory.h"
 #include "vulkan/vulkan_context.h"
 #include "api/ops/helpers.h"
 
-// Fused causal SDPA for the training path (A5 in experiments/training_speedup.md).
+// Fused SDPA for the training path (A5 in experiments/training_speedup.md).
 // The math decomposition materializes B*H*T*T fp32 scores and runs softmax and
 // the whole backward as dozens of pointwise/reduction kernels through the
 // dispatcher; here the forward is one kernel (sdpa_fwd_main: QK^T + softmax +
@@ -24,7 +25,11 @@
 // Routing: aten::scaled_dot_product_attention is overridden under
 // AutogradPrivateUse1 (the op itself is CompositeImplicitAutograd, so a backend
 // key would never be consulted); unsupported cases fall back to the native
-// composite, whose math path behaves exactly as before.
+// composite, whose math path behaves exactly as before. Covered: causal and
+// non-causal, additive fp32/fp16 and bool masks broadcastable to (L, S), any
+// L/S (the former 4096 cap was historical — the two-pass kernel keeps only a
+// 128-float scratch; the 32-bit guard on the materialized probs is what
+// actually bounds the shapes).
 
 namespace torchvulkan {
 
@@ -34,10 +39,6 @@ constexpr uint32_t SDPA_WG = 128;
 // q-строк на workgroup в fwd/bwd (row-tiling, generic R в sdpa.slang;
 // константа в config.py должна совпадать)
 constexpr int64_t SDPA_ROWS_R = 4;
-// historical cap of the single-pass kernel (score row in groupshared memory);
-// the two-pass kernel keeps only a 128-float scratch, but the probs
-// materialization B*Hkv*qpg*L*S makes larger rows pointless anyway
-constexpr int64_t SDPA_L_CAP = 4096;
 constexpr int64_t SDPA_HD_CAP = 128;
 
 bool sdpa_env_disabled()
@@ -52,16 +53,55 @@ uint32_t sdpa_grid_rows(int64_t rows, const DeviceContext* device)
     return static_cast<uint32_t>(std::min<int64_t>(rows, limit));
 }
 
+// strides (elements) for reading `mask` as a 2D broadcast over (L, S), or
+// nullopt when the shape can't be served by the kernels: only masks whose
+// last dim indexes S, the one before it L and every leading dim is 1 (i.e.
+// anything at::broadcastable to (L, S) without folding the batch/head dims).
+// Size-1 dims index with stride 0; broadcast views (stride 0 on a sized dim)
+// and arbitrary inner strides pass through unchanged.
+static std::optional<std::pair<int64_t, int64_t>> sdpa_mask_strides(
+    const at::Tensor& mask, int64_t l, int64_t s)
+{
+    const auto sizes = mask.sizes();
+    const auto strides = mask.strides();
+    const int64_t nd = sizes.size();
+    if (nd < 1 || sizes[nd - 1] == 0) return std::nullopt;
+    if (sizes[nd - 1] != 1 && sizes[nd - 1] != s) return std::nullopt;
+    const int64_t s1 = sizes[nd - 1] == 1 ? 0 : strides[nd - 1];
+    int64_t s0 = 0;
+    if (nd >= 2)
+    {
+        if (sizes[nd - 2] != 1 && sizes[nd - 2] != l) return std::nullopt;
+        s0 = sizes[nd - 2] == 1 ? 0 : strides[nd - 2];
+        for (int64_t d = 0; d < nd - 2; d++)
+            if (sizes[d] != 1) return std::nullopt;
+    }
+    return std::make_pair(s0, s1);
+}
+
+// the kernels read an additive fp32 mask; bool masks become 0 / -inf exactly
+// like the math path's convert_boolean_attn_mask, other dtypes are cast
+static at::Tensor sdpa_prepare_mask(const at::Tensor& attn_mask)
+{
+    if (attn_mask.scalar_type() == at::kBool)
+    {
+        return at::masked_fill(
+            at::zeros(attn_mask.sizes(), attn_mask.options().dtype(at::kFloat)),
+            attn_mask.logical_not(), -std::numeric_limits<float>::infinity());
+    }
+    return attn_mask.scalar_type() == at::kFloat ? attn_mask : attn_mask.to(at::kFloat);
+}
+
 } // namespace
 
-// whether the fused causal path can run this call; everything else keeps the
+// whether the fused path can run this call; everything else keeps the
 // native composite (math) semantics
 bool sdpa_route_ok(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
     const c10::optional<at::Tensor>& attn_mask, double dropout_p, bool is_causal,
     bool enable_gqa)
 {
     if (sdpa_env_disabled()) return false;
-    if (!is_causal || dropout_p != 0.0 || attn_mask.has_value()) return false;
+    if (dropout_p != 0.0) return false;
     if (!q.is_privateuseone() || !k.is_privateuseone() || !v.is_privateuseone()) return false;
     if (q.scalar_type() != at::kHalf && q.scalar_type() != at::kFloat) return false;
     if (k.scalar_type() != q.scalar_type() || v.scalar_type() != q.scalar_type()) return false;
@@ -75,7 +115,26 @@ bool sdpa_route_ok(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v
     if (hkv < 1 || hq < 1 || hq % hkv != 0) return false;
     if (!enable_gqa && hq != hkv) return false;
     const int64_t l = q.size(2), s = k.size(2);
-    if (l < 1 || s < 1 || l > SDPA_L_CAP || s > SDPA_L_CAP) return false;
+    if (l < 1 || s < 1) return false;
+    // torch's own contract (validate + math kernel TORCH_CHECK): explicit mask
+    // and is_causal are mutually exclusive — route out so the native composite
+    // raises the same error
+    if (is_causal && attn_mask.has_value()) return false;
+    if (attn_mask.has_value())
+    {
+        const at::Tensor& mask = *attn_mask;
+        if (!mask.is_privateuseone() || mask.device() != q.device()) return false;
+        // bool -> additive on the host; the kernel reads fp32 only. Same dtype
+        // set the composite's validate_sdpa_input accepts (bool / float /
+        // query dtype)
+        if (mask.scalar_type() != at::kBool && mask.scalar_type() != at::kFloat
+            && mask.scalar_type() != q.scalar_type()) return false;
+        // math path would differentiate through an additive mask; rare — keep
+        // it on the composite
+        if (mask.requires_grad() || mask.numel() == 0) return false;
+        if (!fits_32bit_indexing({mask})) return false;
+        if (!sdpa_mask_strides(mask, l, s).has_value()) return false;
+    }
     // контiguity не требуется: sdpa_causal_fwd/bwd копируют в contiguous
     // (типичный кейс llm — v после permute), копия бесплатна для уже
     // непрерывных входов
@@ -90,10 +149,12 @@ bool sdpa_route_ok(const at::Tensor& q, const at::Tensor& k, const at::Tensor& v
     return true;
 }
 
-// out = softmax(scale * q k^T masked to j <= i) v; also materializes the
-// probability row P (causal entries past the diagonal zeroed) for the backward
+// out = softmax(scale * q k^T + mask) v with the optional causal tril; also
+// materializes the probability row P (causal and masked entries zero) for the
+// backward
 std::tuple<at::Tensor, at::Tensor> sdpa_causal_fwd(const at::Tensor& q, const at::Tensor& k,
-    const at::Tensor& v, double scale)
+    const at::Tensor& v, const c10::optional<at::Tensor>& attn_mask, bool is_causal,
+    double scale)
 {
     const int64_t b = q.size(0), hq = q.size(1), l = q.size(2), hd = q.size(3);
     const int64_t hkv = k.size(1), s = k.size(2);
@@ -107,6 +168,20 @@ std::tuple<at::Tensor, at::Tensor> sdpa_causal_fwd(const at::Tensor& q, const at
     at::Tensor qc = q.contiguous();
     at::Tensor kc = k.contiguous();
     at::Tensor vc = v.contiguous();
+    at::Tensor mask;
+    uint64_t mask_addr = 0;
+    uint32_t mask_s0 = 0, mask_s1 = 0, has_mask = 0;
+    if (attn_mask.has_value() && attn_mask->defined())
+    {
+        mask = sdpa_prepare_mask(*attn_mask);
+        auto strides = sdpa_mask_strides(mask, l, s);
+        TORCH_CHECK(strides.has_value(),
+            "torchvulkan [ERROR]: sdpa_fwd attn_mask of shape ", mask.sizes(),
+            " is not broadcastable to (L, S) = (", l, ", ", s, ").");
+        mask_s0 = static_cast<uint32_t>(strides->first);
+        mask_s1 = static_cast<uint32_t>(strides->second);
+        has_mask = 1;
+    }
 
     DeviceContext* device = get_device_context(qc);
     // row-tiling: один WG обрабатывает SDPA_ROWS_R подряд идущих строк
@@ -121,6 +196,7 @@ std::tuple<at::Tensor, at::Tensor> sdpa_causal_fwd(const at::Tensor& q, const at
     materialize_cow(qc);
     materialize_cow(kc);
     materialize_cow(vc);
+    if (has_mask) materialize_cow(mask);
 
     SpecializationBuilder spd{}; // WG задан compile-time константой в config.py
     SpecializationArgs specialization = spd.build();
@@ -141,13 +217,20 @@ std::tuple<at::Tensor, at::Tensor> sdpa_causal_fwd(const at::Tensor& q, const at
     pcs.push(rows_x);
     pcs.push(static_cast<uint32_t>(tph));
     pcs.push(static_cast<float>(scale));
+    pcs.push(has_mask ? get_tensor_address(mask) : uint64_t(0));
+    pcs.push(mask_s0);
+    pcs.push(mask_s1);
+    pcs.push(has_mask);
+    pcs.push(is_causal ? uint32_t(1) : uint32_t(0));
 
+    std::vector<at::Tensor> read = {qc, kc, vc};
+    if (has_mask) read.push_back(mask);
     device->shader_manager->dispatchShader(
         ShaderKey{torchvulkan::Kernel::SDPA_FWD, qc.scalar_type()},
         device->default_subgroup_size,
         specialization,
         pcs.build(),
-        /* read = */ {qc, kc, vc},
+        read,
         /* write = */ {out, probs},
         rows_x, grid_y, 1
     );
@@ -200,12 +283,14 @@ at::Tensor sdpa_rowdot(const at::Tensor& a, const at::Tensor& b)
     return out;
 }
 
-// dS = scale * P * (dP - delta[row]), causal entries (j > i) zeroed; probs/dP/dS
-// share the (..., L, S) layout, delta has one fp32 value per row. The scale is
-// the scores multiplier folded in the forward: the chain back to q/k is
-// ds_ij/dq_i = scale * k_j, so one multiply here fixes both dQ and dK.
+// dS = scale * P * (dP - delta[row]); causal entries (j > i) zeroed when the
+// forward ran causal (masked entries are already exactly 0 in P — exp(-inf) —
+// so the mask needs no handling here); probs/dP/dS share the (..., L, S)
+// layout, delta has one fp32 value per row. The scale is the scores
+// multiplier folded in the forward: the chain back to q/k is ds_ij/dq_i =
+// scale * k_j, so one multiply here fixes both dQ and dK.
 at::Tensor sdpa_ds(const at::Tensor& probs, const at::Tensor& dP, const at::Tensor& delta,
-    int64_t l, double scale)
+    int64_t l, bool is_causal, double scale)
 {
     TORCH_CHECK(probs.sizes() == dP.sizes(),
         "torchvulkan [ERROR]: sdpa_ds probs (", probs.sizes(), ") and dP (", dP.sizes(), ") must match.");
@@ -250,6 +335,7 @@ at::Tensor sdpa_ds(const at::Tensor& probs, const at::Tensor& dP, const at::Tens
     pcs.push(static_cast<uint32_t>(l));
     pcs.push(blocks_x);
     pcs.push(static_cast<float>(scale));
+    pcs.push(is_causal ? uint32_t(1) : uint32_t(0));
 
     device->shader_manager->dispatchShader(
         ShaderKey{torchvulkan::Kernel::SDPA_DS, pc.scalar_type()},
@@ -267,7 +353,7 @@ at::Tensor sdpa_ds(const at::Tensor& probs, const at::Tensor& dP, const at::Tens
 // the fused backward: (dQ, dK, dV) from grad_out and the forward's saved state
 std::tuple<at::Tensor, at::Tensor, at::Tensor> sdpa_causal_backward(const at::Tensor& grad_out,
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, const at::Tensor& out,
-    const at::Tensor& probs, double scale)
+    const at::Tensor& probs, bool is_causal, double scale)
 {
     const int64_t b = q.size(0), hq = q.size(1), l = q.size(2), hd = q.size(3);
     const int64_t hkv = k.size(1), s = k.size(2);
@@ -291,7 +377,7 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> sdpa_causal_backward(const at::Te
     // rounds only its output, so no fp32 materialization of dO/V and no extra
     // cast dispatches; the dS product itself is fp32 inside sdpa_ds
     at::Tensor dP = at::matmul(dO_g, vc.transpose(-2, -1));
-    at::Tensor dS = sdpa_ds(p_g, dP, delta, l, scale);          // (b, hkv, qpg*l, s)
+    at::Tensor dS = sdpa_ds(p_g, dP, delta, l, is_causal, scale); // (b, hkv, qpg*l, s)
 
     at::Tensor dQ = at::matmul(dS, kc);                         // (b, hkv, qpg*l, hd)
     at::Tensor dK = at::matmul(dS.transpose(-2, -1), q_g);      // (b, hkv, s, hd)
@@ -302,6 +388,26 @@ std::tuple<at::Tensor, at::Tensor, at::Tensor> sdpa_causal_backward(const at::Te
 
 namespace {
 
+// the attn_mask can't travel through Function::apply: an undefined tensor
+// input trips InputMetadata's device() (custom_function.h builds input_info_
+// for every tensor arg, defined or not), so the entries park the raw mask in
+// a thread-local slot and the autograd forward — which runs synchronously on
+// the same thread inside apply — picks it up. The mask itself needs no
+// gradient (route_ok refuses requires_grad masks) and no saved versioning:
+// the backward consumes only the materialized P, which already carries the
+// masking as exact zeros.
+thread_local c10::optional<at::Tensor> tls_sdpa_mask;
+struct TlsSdpaMaskGuard
+{
+    c10::optional<at::Tensor> saved;
+    explicit TlsSdpaMaskGuard(c10::optional<at::Tensor> mask)
+        : saved(std::move(tls_sdpa_mask))
+    {
+        tls_sdpa_mask = std::move(mask);
+    }
+    ~TlsSdpaMaskGuard() { tls_sdpa_mask = std::move(saved); }
+};
+
 // one autograd node for both entry points; F.scaled_dot_product_attention
 // exposes only the output, the math override also surfaces probs (no gradient
 // through it — same as calling into a fused backend kernel). The forward
@@ -310,10 +416,12 @@ namespace {
 struct SdpaAutogradFunction : public torch::autograd::Function<SdpaAutogradFunction>
 {
     static torch::autograd::variable_list forward(torch::autograd::AutogradContext* ctx,
-        const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, double scale)
+        const at::Tensor& q, const at::Tensor& k, const at::Tensor& v, bool is_causal,
+        double scale)
     {
-        auto fwd = sdpa_causal_fwd(q, k, v, scale);
+        auto fwd = sdpa_causal_fwd(q, k, v, tls_sdpa_mask, is_causal, scale);
         ctx->save_for_backward({q, k, v, std::get<0>(fwd), std::get<1>(fwd)});
+        ctx->saved_data["causal"] = is_causal;
         ctx->saved_data["scale"] = scale;
         return {std::get<0>(fwd), std::get<1>(fwd)};
     }
@@ -322,11 +430,13 @@ struct SdpaAutogradFunction : public torch::autograd::Function<SdpaAutogradFunct
         torch::autograd::variable_list grad_out)
     {
         auto saved = ctx->get_saved_variables();
+        const bool is_causal = ctx->saved_data["causal"].toBool();
         const double scale = ctx->saved_data["scale"].toDouble();
         auto grads = sdpa_causal_backward(grad_out[0], saved[0], saved[1], saved[2], saved[3],
-            saved[4], scale);
-        // один градиент на каждый вход forward: q, k, v, scale
-        return {std::get<0>(grads), std::get<1>(grads), std::get<2>(grads), at::Tensor()};
+            saved[4], is_causal, scale);
+        // один градиент на каждый вход forward: q, k, v, is_causal, scale
+        return {std::get<0>(grads), std::get<1>(grads), std::get<2>(grads), at::Tensor(),
+            at::Tensor()};
     }
 };
 
@@ -345,7 +455,8 @@ at::Tensor scaled_dot_product_attention_vulkan(const at::Tensor& q, const at::Te
     const double effective = scale.has_value()
         ? *scale
         : 1.0 / std::sqrt(static_cast<double>(q.size(3)));
-    return SdpaAutogradFunction::apply(q, k, v, effective)[0];
+    TlsSdpaMaskGuard guard(attn_mask);
+    return SdpaAutogradFunction::apply(q, k, v, is_causal, effective)[0];
 }
 
 namespace {
@@ -357,8 +468,7 @@ bool sdpa_math_route_ok(const at::Tensor& q, const at::Tensor& k, const at::Tens
     const c10::optional<at::Tensor>& attn_mask, double dropout_p,
     const c10::optional<at::Tensor>& dropout_mask, bool is_causal, bool enable_gqa)
 {
-    if (attn_mask.has_value() || dropout_mask.has_value() || dropout_p != 0.0 || !is_causal)
-        return false;
+    if (dropout_mask.has_value() || dropout_p != 0.0) return false;
     if (!q.is_privateuseone() || !k.is_privateuseone() || !v.is_privateuseone()) return false;
     if (q.dim() != 4 || k.dim() != 4 || v.dim() != 4) return false;
     const int64_t hq = q.size(1), hkv = k.size(1);
@@ -450,12 +560,16 @@ std::tuple<at::Tensor, at::Tensor> scaled_dot_product_attention_math_vulkan(
         && (q.requires_grad() || k.requires_grad() || v.requires_grad());
     if (!needs_grad)
     {
-        auto fwd = sdpa_causal_fwd(q, k, v, effective);
+        auto fwd = sdpa_causal_fwd(q, k, v, attn_mask, is_causal, effective);
         // контракт math-кернела: ОБА выхода — attn (второй — та же матрица до
         // каста dtype; без upcast это тот же тензор), не вероятности
         return {std::get<0>(fwd), std::get<0>(fwd)};
     }
-    auto outs = SdpaAutogradFunction::apply(q, k, v, effective);
+    auto outs = [&]
+    {
+        TlsSdpaMaskGuard guard(attn_mask);
+        return SdpaAutogradFunction::apply(q, k, v, is_causal, effective);
+    }();
     return {outs[0], outs[0]};
 }
 
