@@ -95,6 +95,20 @@ def memory_stats(device=None) -> dict:
         "reserved_bytes.all.current": _C._memory_reserved(index),
     }
 
+def host_memory_fallback() -> dict:
+    """Allocator's host-memory fallback accounting (cumulative over all devices).
+
+    When VRAM is exhausted and TORCHVULKAN_STRICT_ALLOCATION is not set, new
+    buffers spill into host-backed memory (PCIe-slow, up to ~50x slower).
+    Returns {"count": <allocations>, "bytes": <volume>} since the last
+    reset_host_memory_fallback(); a clean strict run stays at 0.
+    """
+    count, size = _C._host_memory_fallback_stats()
+    return {"count": count, "bytes": size}
+
+def reset_host_memory_fallback() -> None:
+    _C._reset_host_memory_fallback_stats()
+
 DeviceProperties = namedtuple("DeviceProperties", ["name", "total_memory", "vendor_id", "device_id", "api_version", "driver_version", "subgroup_size", "has_fp64", "has_int64", "has_fp16", "has_bf16", "has_int16", "has_int8"])
 
 def get_device_properties(device=None) -> DeviceProperties:
@@ -183,6 +197,8 @@ def weight_int4_mm(x, w_packed, scales, zeros, bias=None) -> torch.Tensor:
 
 def _is_in_bad_fork() -> bool:
     return _C._is_in_bad_fork()
+
+from .optim import AdamWFused16  # noqa: E402 (needs torch fully set up above)
 
 atexit.register(_C._save_pipeline_caches)
 

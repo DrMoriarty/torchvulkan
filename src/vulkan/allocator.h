@@ -38,3 +38,11 @@ private:
 };
 
 extern VulkanAllocator globalVulkanAllocator;
+
+// Host-memory fallback accounting: when VRAM is exhausted the allocator
+// spills new buffers into host-backed memory (PCIe-slow, up to ~50x on
+// elementwise work), which otherwise stays invisible behind a single
+// TORCH_WARN_ONCE. The counters — cumulative since the last reset, all
+// devices — are exposed to python as torchvulkan.host_memory_fallback().
+std::pair<uint64_t, uint64_t> hostMemoryFallbackStats();
+void resetHostMemoryFallbackStats();

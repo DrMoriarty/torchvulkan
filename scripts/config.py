@@ -387,4 +387,15 @@ KERNELS = [
     Kernel('dwconv_wgrad', 'ops/dwconv_train.slang', [
         Entry('dwconv_wgrad_main', [F16, F32], (), constants=(256,)),
     ]),
+    # fused AdamW/Adam optimizer step (experiments/lfm2_train_profile.md
+    # приоритет 5): один flat-кернел обновляет param/m/v in place — 1 диспетч
+    # на параметр вместо ~6 aten-опов eager-декомпозиции _fused_adamw_.
+    # Типы парные: T — param/grad/m, U — v; компактный вариант под 4 ГБ VRAM —
+    # T=fp16, U=fp32 (v в fp16 уходит под floor при g^2 ~ 1e-8 и denom
+    # схлопывается в eps -> гигантские шаги, см. adamw.slang). Математика в
+    # fp32 регистрах, bias-коррекции с хоста (fp64). 256 — compile-time
+    # константа workgroup'а (как у dwconv)
+    Kernel('adamw', 'ops/adamw.slang', [
+        Entry('adamw_main', [F16, F32], (), pairwise=True, constants=(256,)),
+    ]),
 ]

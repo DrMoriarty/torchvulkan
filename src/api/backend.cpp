@@ -97,6 +97,16 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         device->peak_allocated_bytes.store(device->allocated_bytes.load());
     });
 
+    // host-memory fallback of the allocator (allocator.cpp): cumulative count
+    // and byte volume of buffers allocated in host memory instead of VRAM
+    m.def("_host_memory_fallback_stats", []() -> std::pair<uint64_t, uint64_t> {
+        return hostMemoryFallbackStats();
+    });
+
+    m.def("_reset_host_memory_fallback_stats", []() {
+        resetHostMemoryFallbackStats();
+    });
+
     m.def("_record_storage_slice_deleter", [](const at::Tensor& slice) {
         storage_slice_deleter() = slice.storage().data_ptr().get_deleter();
     });

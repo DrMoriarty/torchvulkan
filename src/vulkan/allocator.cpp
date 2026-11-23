@@ -1,10 +1,56 @@
 #include "allocator.h"
 #include "shader.h"
 
+#include <atomic>
 #include <cstring>
 
 VulkanAllocator globalVulkanAllocator;
 REGISTER_ALLOCATOR(c10::DeviceType::PrivateUse1, &globalVulkanAllocator);
+
+namespace {
+
+// host-memory fallback accounting (see allocator.h): cumulative count/bytes of
+// buffers allocated in host memory instead of VRAM, plus the warning levels
+// already fired (bit per threshold)
+std::atomic<uint64_t> g_hostFallbackCount{0};
+std::atomic<uint64_t> g_hostFallbackBytes{0};
+std::atomic<uint32_t> g_hostFallbackWarned{0};
+
+void recordHostFallback(size_t bytes, const std::string& deviceName)
+{
+    const uint64_t count = g_hostFallbackCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    const uint64_t total = g_hostFallbackBytes.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+
+    // A spill quietly costs up to ~50x on PCIe, so it must not stay silent:
+    // warn on the first spill and each time the cumulative total crosses
+    // 64 MB / 512 MB / 4 GB — with the running sums in the message. Totals
+    // stay queryable via torchvulkan.host_memory_fallback().
+    static constexpr uint64_t THRESHOLDS[] = {0, 1ull << 26, 1ull << 29, 1ull << 32};
+    for (uint32_t level = 0; level < 4; ++level) {
+        if (total < THRESHOLDS[level]) break;
+        const uint32_t bit = 1u << level;
+        if (g_hostFallbackWarned.load(std::memory_order_relaxed) & bit) continue;
+        if (g_hostFallbackWarned.fetch_or(bit) & bit) continue;
+        TORCH_WARN("torchvulkan [WARNING]: Vulkan device memory is exhausted, allocating in HOST memory on ", deviceName,
+            " (PCIe-slow, up to ~50x slower). Cumulative: ", count, " allocations / ", total,
+            " bytes. Query torchvulkan.host_memory_fallback() for the running totals; set "
+            "TORCHVULKAN_STRICT_ALLOCATION=1 to raise an out-of-memory error instead.");
+    }
+}
+
+} // namespace
+
+std::pair<uint64_t, uint64_t> hostMemoryFallbackStats()
+{
+    return {g_hostFallbackCount.load(std::memory_order_relaxed), g_hostFallbackBytes.load(std::memory_order_relaxed)};
+}
+
+void resetHostMemoryFallbackStats()
+{
+    g_hostFallbackCount.store(0, std::memory_order_relaxed);
+    g_hostFallbackBytes.store(0, std::memory_order_relaxed);
+    g_hostFallbackWarned.store(0, std::memory_order_relaxed);
+}
 
 bool VulkanAllocator::initialized()
 {
@@ -186,11 +232,11 @@ VulkanBuffer* VulkanAllocator::allocateBuffer(DeviceContext* device, size_t size
         if (VulkanBuffer* buffer = createBuffer(device, size, usage)) return buffer;
     }
 
-    if (!VulkanContext::Instance().strictAllocationEnabled()) 
+    if (!VulkanContext::Instance().strictAllocationEnabled())
     {
         if (VulkanBuffer* buffer = createBuffer(device, size, usage))
         {
-            TORCH_WARN_ONCE("torchvulkan [WARNING]: Vulkan memory may be allocated using host memory, which may cause performance degradation. Set TORCHVULKAN_STRICT_ALLOCATION=1 to raise an out-of-memory error instead.");
+            recordHostFallback(size, device->properties.deviceName);
             return buffer;
         }
     }

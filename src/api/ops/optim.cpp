@@ -1,5 +1,8 @@
 #include <torch/extension.h>
 #include <cmath>
+#include <limits>
+#include <optional>
+#include <utility>
 #include <vector>
 #include "api/ops/helpers.h"
 
@@ -85,6 +88,86 @@ void adam_step(
     param.copy_(at::sub(p, at::div(at::mul(m, lr / bias_correction1), denom)));
 }
 
+// --- fused AdamW/Adam kernel path (experiments/lfm2_train_profile.md, приоритет 5) ---
+
+// the adamw variant's workgroup size: a compile-time constant in config.py
+constexpr uint32_t ADAM_WG = 256;
+
+// The fast path covers the torch.optim.AdamW(fused=True) layouts: fp16/fp32
+// params with contiguous states, m in the param dtype (zeros_like(p)), v in
+// the param dtype OR fp32 (the compact-state layout that keeps AdamW in 4 GB
+// VRAM without v's fp16 underflow — see adamw.slang). The check is per
+// parameter — one strided grad routes just that parameter to the eager
+// decomposition, not the whole step. Returns the dispatch types or nullopt.
+std::optional<std::pair<at::ScalarType, at::ScalarType>> adam_param_fusable(
+    const at::Tensor& p, const at::Tensor& g, const at::Tensor& m, const at::Tensor& v)
+{
+    const at::ScalarType st = p.scalar_type();
+    if (st != at::kHalf && st != at::kFloat) return std::nullopt;
+    if (!p.is_privateuseone() || p.numel() == 0 || !p.is_contiguous()) return std::nullopt;
+    for (const at::Tensor* t : {&g, &m}) {
+        if (t->scalar_type() != st || !t->is_contiguous() || t->numel() != p.numel()) return std::nullopt;
+    }
+    const at::ScalarType vt = v.scalar_type();
+    if (vt != st && vt != at::kFloat) return std::nullopt;
+    if (!v.is_contiguous() || v.numel() != p.numel()) return std::nullopt;
+    return std::make_pair(st, vt);
+}
+
+// One dispatch per parameter (adamw.slang): param/m/v updated in place, math
+// in fp32 registers, bias corrections computed here in fp64. The tensors keep
+// their own dtype — for fp16 params this is the compact-state variant that
+// keeps AdamW inside 4 GB VRAM (fp16 states, half the eager path's fp32 ones).
+void adamw_fused_kernel(const at::Tensor& p, const at::Tensor& g, const at::Tensor& m,
+    const at::Tensor& v, const std::pair<at::ScalarType, at::ScalarType>& types,
+    double step, double lr, double beta1, double beta2,
+    double weight_decay, double eps, bool maximize, AdamMode mode)
+{
+    const int64_t numel = p.numel();
+    TORCH_CHECK(numel <= static_cast<int64_t>(std::numeric_limits<uint32_t>::max()),
+        "torchvulkan [ERROR]: fused AdamW parameter with ", numel, " elements exceeds 32-bit indexing.");
+
+    const double bc1 = 1.0 - std::pow(beta1, step);
+    const double bc2sqrt = std::sqrt(1.0 - std::pow(beta2, step));
+    const uint32_t flags = (mode == AdamMode::ADAMW ? 1u : 0u) | (maximize ? 2u : 0u);
+
+    DeviceContext* device = get_device_context(p);
+    materialize_cow(p);
+    materialize_cow(m);
+    materialize_cow(v);
+
+    // порядок пушей = порядку полей AdamWPushConstants (см. шейдер)
+    PushConstantBuilder pcs{};
+    pcs.push(get_output_address(p));
+    pcs.push(get_tensor_address(g));
+    pcs.push(get_output_address(m));
+    pcs.push(get_output_address(v));
+    pcs.push(static_cast<uint32_t>(numel));
+    pcs.push(flags);
+    pcs.push(static_cast<float>(bc1));
+    pcs.push(static_cast<float>(bc2sqrt));
+    pcs.push(static_cast<float>(lr));
+    pcs.push(static_cast<float>(beta1));
+    pcs.push(static_cast<float>(beta2));
+    pcs.push(static_cast<float>(weight_decay));
+    pcs.push(static_cast<float>(eps));
+
+    const uint64_t groups = (static_cast<uint64_t>(numel) + ADAM_WG - 1) / ADAM_WG;
+    // flat_group (indexing.slang) folds y into the group id past the x-limit
+    const uint32_t groupX = static_cast<uint32_t>(std::min<uint64_t>(groups, GROUP_ROW));
+    const uint32_t groupY = static_cast<uint32_t>((groups + GROUP_ROW - 1) / GROUP_ROW);
+
+    device->shader_manager->dispatchShader(
+        ShaderKey{torchvulkan::Kernel::ADAMW, types.first, types.second},
+        device->default_subgroup_size,
+        SpecializationArgs{},
+        pcs.build(),
+        /* read = */ {g},
+        /* write = */ {p, m, v},
+        groupX, groupY, 1
+    );
+}
+
 void fused_adam(
     at::TensorList params,
     at::TensorList grads,
@@ -118,7 +201,14 @@ void fused_adam(
         offset = 1;
     }
 
+    const bool try_fused = !amsgrad && !grad_scale.has_value();
     for (size_t i = 0; i < n; ++i) {
+        std::optional<std::pair<at::ScalarType, at::ScalarType>> types;
+        if (try_fused && (types = adam_param_fusable(params[i], grads[i], exp_avgs[i], exp_avg_sqs[i]))) {
+            adamw_fused_kernel(params[i], grads[i], exp_avgs[i], exp_avg_sqs[i], *types, host[offset + i],
+                lr, beta1, beta2, weight_decay, eps, maximize, mode);
+            continue;
+        }
         adam_step(params[i], grads[i], exp_avgs[i], exp_avg_sqs[i], amsgrad ? max_exp_avg_sqs[i] : at::Tensor(),
             host[offset + i], lr, beta1, beta2, weight_decay, eps, amsgrad, maximize, grad_scale, mode
         );
