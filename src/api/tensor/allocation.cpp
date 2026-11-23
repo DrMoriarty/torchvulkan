@@ -7,6 +7,7 @@
 #include <c10/core/DeviceGuard.h>
 #include "vulkan/memory.h"
 #include "vulkan/allocator.h"
+#include "vulkan/alloc_context.h"
 #include "vulkan/vulkan_context.h"
 #include "api/ops/helpers.h"
 #include "api/ops/internal.h"
@@ -62,19 +63,25 @@ at::Tensor empty_memory_format_vulkan(
 
     std::vector<int64_t> strides = compute_strides(concrete_sizes, memory_format_);
 
+    // attach shape/dtype to the allocation the StorageImpl constructor makes
+    // (vulkan/alloc_context.h) so an OOM message can name the tensor
+    torchvulkan::alloc_context::Pending pending_ctx(
+        torchvulkan::alloc_context::format_shape(concrete_sizes),
+        std::string(c10::getDtypeNames(dtype_).first));
+
     auto storage_impl = c10::make_intrusive<c10::StorageImpl>(
         c10::StorageImpl::use_byte_size_t(),
         nbytes,
         c10::GetAllocator(c10::DeviceType::PrivateUse1),
-        /* resizeable = */ true 
+        /* resizeable = */ true
     );
-    
+
     at::Tensor tensor = at::detail::make_tensor<at::TensorImpl>(
         std::move(storage_impl),
         c10::DispatchKey::PrivateUse1,
         c10::scalarTypeToTypeMeta(dtype_)
     );
-    
+
     tensor.unsafeGetTensorImpl()->set_sizes_and_strides(concrete_sizes, strides);
     fill_deterministic_if_enabled(tensor);
 
@@ -111,10 +118,14 @@ at::Tensor empty_strided_vulkan(
     
     at::detail::check_size_nonnegative(concrete_sizes);
     size_t nbytes = at::detail::computeStorageNbytes(
-        concrete_sizes, 
-        concrete_strides, 
+        concrete_sizes,
+        concrete_strides,
         c10::elementSize(dtype_)
     );
+
+    torchvulkan::alloc_context::Pending pending_ctx(
+        torchvulkan::alloc_context::format_shape(concrete_sizes),
+        std::string(c10::getDtypeNames(dtype_).first));
 
     auto storage_impl = c10::make_intrusive<c10::StorageImpl>(
         c10::StorageImpl::use_byte_size_t(),
@@ -168,6 +179,9 @@ const at::Tensor& torchvulkan::resize_vulkan(
 
     if (impl->storage().nbytes() < new_bytes) {
         int64_t old_bytes = static_cast<int64_t>(impl->storage().nbytes());
+        torchvulkan::alloc_context::Pending pending_ctx(
+            torchvulkan::alloc_context::format_shape(size),
+            std::string(c10::getDtypeNames(self.scalar_type()).first));
         torchvulkan::resize_bytes_vulkan(impl->storage().unsafeGetStorageImpl(), new_bytes);
         if (at::globalContext().deterministicAlgorithms() && at::globalContext().deterministicFillUninitializedMemory()) {
             at::native::fill_resize_deterministic_(self, old_bytes);

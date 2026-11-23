@@ -3,6 +3,7 @@
 #include "vulkan/vulkan_context.h"
 #include "vulkan/memory.h"
 #include "vulkan/allocator.h"
+#include "vulkan/alloc_context.h"
 #include "vulkan/generator.h"
 #include "vulkan/shader.h"
 #include "api/ops/fusion.h"
@@ -105,6 +106,26 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     m.def("_reset_host_memory_fallback_stats", []() {
         resetHostMemoryFallbackStats();
+    });
+
+    // thread-local ring of the last large allocation requests (vulkan/alloc_context.h):
+    // what the OutOfMemoryError message prints, queryable before it fires
+    m.def("alloc_context", []() {
+        std::vector<py::dict> out;
+        for (const auto& record : torchvulkan::alloc_context::snapshot())
+        {
+            py::dict entry;
+            entry["bytes"] = py::cast<uint64_t>(record.nbytes);
+            entry["shape"] = record.shape;
+            entry["dtype"] = record.dtype;
+            entry["op"] = record.op;
+            out.push_back(std::move(entry));
+        }
+        return out;
+    });
+
+    m.def("clear_alloc_context", []() {
+        torchvulkan::alloc_context::clear();
     });
 
     m.def("_record_storage_slice_deleter", [](const at::Tensor& slice) {

@@ -109,6 +109,21 @@ def host_memory_fallback() -> dict:
 def reset_host_memory_fallback() -> None:
     _C._reset_host_memory_fallback_stats()
 
+def allocation_context() -> list[dict]:
+    """Thread-local ring of the last large allocation requests (>= 512 KiB).
+
+    Same content the OutOfMemoryError message prints (vulkan/alloc_context.h):
+    one {"bytes", "shape", "dtype", "op"} dict per request, oldest first; the
+    last entry is the most recent request (op is only filled when
+    TORCHVULKAN_ALLOC_TRACE=1). Useful to catch a runaway tensor before it
+    exhausts VRAM.
+    """
+    return _C.alloc_context()
+
+def clear_allocation_context() -> None:
+    """Forget the recorded allocation context of the current thread."""
+    _C.clear_alloc_context()
+
 DeviceProperties = namedtuple("DeviceProperties", ["name", "total_memory", "vendor_id", "device_id", "api_version", "driver_version", "subgroup_size", "has_fp64", "has_int64", "has_fp16", "has_bf16", "has_int16", "has_int8"])
 
 def get_device_properties(device=None) -> DeviceProperties:

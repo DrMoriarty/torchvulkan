@@ -1,4 +1,5 @@
 #include "allocator.h"
+#include "alloc_context.h"
 #include "shader.h"
 
 #include <atomic>
@@ -106,6 +107,11 @@ c10::DataPtr VulkanAllocator::allocate(size_t nbytes)
 {
     c10::Device device(c10::DeviceType::PrivateUse1, VulkanContext::CurrentDevice());
     if (nbytes == 0) return {nullptr, nullptr, &VulkanAllocator::deleter, device};
+
+    // record the request (consuming the shape/dtype hint the tensor factory
+    // ops attached) before touching the device, so even a failing request
+    // ends up in the thread-local ring the OOM message prints
+    torchvulkan::alloc_context::record(nbytes);
 
     DeviceContext* context = VulkanContext::Instance().CurrentDeviceContext();
     VulkanBuffer* buffer = allocateBuffer(context, nbytes, MemoryUsage::DEVICE_ONLY);
@@ -241,7 +247,24 @@ VulkanBuffer* VulkanAllocator::allocateBuffer(DeviceContext* device, size_t size
         }
     }
 
-    TORCH_CHECK_WITH(OutOfMemoryError, false, "torchvulkan [ERROR]: Out of memory on ", device->properties.deviceName, ". Tried to allocate ",
-        size, " bytes with ", device->memoryUsage(), " of ", device->memoryBudget(), " bytes in use."
+    // diagnostics for the OutOfMemoryError: the failing request itself is
+    // the last entry of the thread-local ring (VulkanAllocator::allocate
+    // records it before reaching here), so the message names the shape and
+    // dtype of the tensor that exhausted the device
+    const char* usage_kind =
+        usage == MemoryUsage::HOST_TO_DEVICE ? "host-to-device staging" :
+        usage == MemoryUsage::DEVICE_TO_HOST ? "device-to-host staging" : "device buffer";
+    const bool strict = VulkanContext::Instance().strictAllocationEnabled();
+    const auto [fallback_count, fallback_bytes] = hostMemoryFallbackStats();
+
+    TORCH_CHECK_WITH(OutOfMemoryError, false, "torchvulkan [ERROR]: Out of memory on ", device->properties.deviceName,
+        ". Tried to allocate ", size, " bytes (", torchvulkan::alloc_context::format_bytes(size), ", ", usage_kind,
+        ") with ", device->memoryUsage(), " bytes (", torchvulkan::alloc_context::format_bytes(device->memoryUsage()),
+        ") of ", device->memoryBudget(), " bytes (", torchvulkan::alloc_context::format_bytes(device->memoryBudget()),
+        ") in use.", torchvulkan::alloc_context::describe(),
+        "\nHost-memory fallback so far: ", fallback_count, " allocations / ", fallback_bytes, " bytes (",
+        torchvulkan::alloc_context::format_bytes(fallback_bytes),
+        ") spilled into system RAM — see torchvulkan.host_memory_fallback()",
+        strict ? "; TORCHVULKAN_STRICT_ALLOCATION is ON, so no spill was attempted for this request." : "."
     );
 }
